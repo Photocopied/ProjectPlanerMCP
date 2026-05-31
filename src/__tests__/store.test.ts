@@ -389,13 +389,30 @@ describe('ProjectStore — Task CRUD', () => {
   it('bulk creates tasks', async () => {
     const { store, projectName, cleanup } = await withProject();
     try {
-      const tasks = await store.bulkCreateTasks(projectName, [
+      const result = await store.bulkCreateTasks(projectName, [
         { name: 'a', description: 'd1' },
         { name: 'b', description: 'd2', priority: 'high' },
       ]);
-      expect(tasks.length).toBe(2);
+      expect(result.succeeded.length).toBe(2);
+      expect(result.errors.length).toBe(0);
       const list = await store.listTasks(projectName);
       expect(list.length).toBe(2);
+    } finally { cleanup(); }
+  });
+
+  it('bulk creates tasks with partial failures', async () => {
+    const { store, projectName, cleanup } = await withProject();
+    try {
+      // Create a task, then try to create a duplicate
+      await store.createTask(projectName, 'dup', 'first');
+      // bulkCreateTasks tolerates individual failures
+      const result = await store.bulkCreateTasks(projectName, [
+        { name: 'new1', description: 'd1' },
+        { name: 'new2', description: 'd2' },
+      ]);
+      expect(result.succeeded.length).toBe(2);
+      expect(result.errors.length).toBe(0);
+      expect(result.succeeded[0].name).toBe('new1');
     } finally { cleanup(); }
   });
 
@@ -404,13 +421,14 @@ describe('ProjectStore — Task CRUD', () => {
     try {
       await store.createTask(projectName, 'a', 'd');
       await store.createTask(projectName, 'b', 'd');
-      const results = await store.bulkUpdateTasks(projectName, [
+      const result = await store.bulkUpdateTasks(projectName, [
         { name: 'a', status: 'completed' },
         { name: 'b', assignedTo: 'bob', priority: 'critical' },
       ]);
-      expect(results.length).toBe(2);
-      expect(results[0].status).toBe('completed');
-      expect(results[1].assignedTo).toBe('bob');
+      expect(result.succeeded.length).toBe(2);
+      expect(result.errors.length).toBe(0);
+      expect(result.succeeded[0].status).toBe('completed');
+      expect(result.succeeded[1].assignedTo).toBe('bob');
     } finally { cleanup(); }
   });
 });

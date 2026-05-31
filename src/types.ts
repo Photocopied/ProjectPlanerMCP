@@ -227,3 +227,14 @@ export interface ValidationIssue {
   field: string;
   message: string;
 }
+
+export interface CorruptedFile {
+  path: string;
+  entityType: string;
+  error: string;
+}
+
+export interface BulkResult<T> {
+  succeeded: T[];
+  errors: Array<{ index: number; name: string; error: string }>;
+}

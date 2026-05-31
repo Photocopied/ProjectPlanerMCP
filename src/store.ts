@@ -24,7 +24,16 @@ import type {
   ProjectTreeEntry,
   SearchResult,
   ValidationIssue,
+  CorruptedFile,
+  BulkResult,
 } from './types.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum number of activity entries kept per project. Oldest are pruned. */
+const DEFAULT_MAX_ACTIVITY = 1_000;
 
 // ---------------------------------------------------------------------------
 // Directory-based data store
@@ -32,10 +41,13 @@ import type {
 
 export class ProjectStore {
   private projectsDir: string;
+  private maxActivityEntries: number;
+  private corruptedFiles: CorruptedFile[] = [];
 
-  constructor() {
+  constructor(options?: { maxActivityEntries?: number }) {
     const paths = envPaths('project-planer-mcp', { suffix: '' });
     this.projectsDir = join(paths.data, 'projects');
+    this.maxActivityEntries = options?.maxActivityEntries ?? DEFAULT_MAX_ACTIVITY;
   }
 
   private projectDir(projectName: string): string {
@@ -94,9 +106,29 @@ export class ProjectStore {
     return join(this.projectDir(projectName), 'Activity');
   }
 
+  // -----------------------------------------------------------------------
+  // I/O helpers
+  // -----------------------------------------------------------------------
+
+  /**
+   * Read a JSON file from disk. Throws McpError on missing file or
+   * malformed JSON instead of raw ENOENT or SyntaxError.
+   */
   private async readJson<T>(filePath: string): Promise<T> {
-    const raw = await readFile(filePath, 'utf-8');
-    return JSON.parse(raw) as T;
+    let raw: string;
+    try {
+      raw = await readFile(filePath, 'utf-8');
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') {
+        throw new McpError(ErrorCode.InvalidParams, `Entity not found: ${filePath}`);
+      }
+      throw new McpError(ErrorCode.InternalError, `Failed to read file: ${filePath} — ${err?.message ?? err}`);
+    }
+    try {
+      return JSON.parse(raw) as T;
+    } catch (err: any) {
+      throw new McpError(ErrorCode.InternalError, `Corrupted JSON in file: ${filePath} — ${err?.message ?? err}`);
+    }
   }
 
   private async writeJson(filePath: string, data: unknown): Promise<void> {
@@ -114,6 +146,43 @@ export class ProjectStore {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * List JSON files from a directory and collect any files that fail
+   * to parse, tracking them in corruptedFiles. Returns successfully
+   * parsed entities.
+   */
+  private async readJsonFiles<T>(dir: string, entityType: string): Promise<T[]> {
+    const files = await this.listJsonFiles(dir);
+    const results: T[] = [];
+    for (const f of files) {
+      try {
+        results.push(await this.readJson<T>(f));
+      } catch (err: any) {
+        this.corruptedFiles.push({
+          path: f,
+          entityType,
+          error: err?.message ?? String(err),
+        });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Reset the corrupted-files accumulator. Call before a batch of
+   * list operations.
+   */
+  private resetCorrupted(): void {
+    this.corruptedFiles = [];
+  }
+
+  /**
+   * Return corrupted files discovered since the last list operation.
+   */
+  getCorruptedFiles(projectName: string): CorruptedFile[] {
+    return [...this.corruptedFiles];
   }
 
   // -- Activity Log --------------------------------------------------------
@@ -138,6 +207,22 @@ export class ProjectStore {
     const filename = timestampedFilename('activity', entityName);
     const aPath = join(this.activityDir(projectName), filename);
     await this.writeJson(aPath, entry);
+    await this.pruneActivity(projectName);
+  }
+
+  /**
+   * Remove oldest activity entries when the count exceeds the maximum.
+   */
+  private async pruneActivity(projectName: string): Promise<void> {
+    const files = await this.listJsonFiles(this.activityDir(projectName));
+    if (files.length <= this.maxActivityEntries) return;
+    const toDelete = files.length - this.maxActivityEntries;
+    const sorted = files.sort(); // already sorted by name (timestamp order)
+    for (let i = 0; i < toDelete; i++) {
+      try {
+        await rm(sorted[i], { force: true });
+      } catch { /* best-effort */ }
+    }
   }
 
   async listActivity(
@@ -150,20 +235,21 @@ export class ProjectStore {
     }
   ): Promise<ActivityLogEntry[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.activityDir(projectName));
-    const entries: ActivityLogEntry[] = [];
-    for (const f of files) {
-      try {
-        const e = await this.readJson<ActivityLogEntry>(f);
-        if (filters?.entityType && e.entityType !== filters.entityType) continue;
-        if (filters?.action && e.action !== filters.action) continue;
-        if (filters?.entityId && e.entityId !== filters.entityId) continue;
-        entries.push(e);
-      } catch { /* skip */ }
-    }
-    entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-    if (filters?.limit && filters.limit > 0) return entries.slice(0, filters.limit);
-    return entries;
+    this.resetCorrupted();
+    const entries: ActivityLogEntry[] = await this.readJsonFiles<ActivityLogEntry>(
+      this.activityDir(projectName),
+      'activity'
+    );
+    // Apply filters in-memory
+    const filtered = entries.filter((e) => {
+      if (filters?.entityType && e.entityType !== filters.entityType) return false;
+      if (filters?.action && e.action !== filters.action) return false;
+      if (filters?.entityId && e.entityId !== filters.entityId) return false;
+      return true;
+    });
+    filtered.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    if (filters?.limit && filters.limit > 0) return filtered.slice(0, filters.limit);
+    return filtered;
   }
 
   // -- Tags ----------------------------------------------------------------
@@ -301,9 +387,7 @@ export class ProjectStore {
   }
 
   async getProject(name: string): Promise<ProjectMeta> {
-    const meta = await this.readJson<ProjectMeta>(this.projectMetaPath(name));
-    if (!meta) throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
-    return meta;
+    return this.readJson<ProjectMeta>(this.projectMetaPath(name));
   }
 
   async updateProject(name: string, updates: Partial<Pick<ProjectMeta, 'description' | 'status'>>): Promise<ProjectMeta> {
@@ -319,7 +403,11 @@ export class ProjectStore {
   async deleteProject(name: string): Promise<void> {
     const projDir = this.projectDir(name);
     if (!existsSync(projDir)) throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
-    await rm(projDir, { recursive: true, force: true });
+    try {
+      await rm(projDir, { recursive: true, force: true });
+    } catch (err: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to delete project "${name}": ${err?.message ?? err}`);
+    }
   }
 
   async archiveProject(name: string): Promise<ProjectMeta> { return this.updateProject(name, { status: 'archived' }); }
@@ -327,7 +415,8 @@ export class ProjectStore {
 
   async getProjectTree(projectName: string): Promise<ProjectTree> {
     await this.getProject(projectName);
-    const readEntries = async <T extends { id: string }>(dir: string, nameKey: string, statusKey?: string, titleKey?: string): Promise<ProjectTreeEntry[]> => {
+    this.resetCorrupted();
+    const readEntries = async <T extends { id: string }>(dir: string, nameKey: string, entityType: string, statusKey?: string, titleKey?: string): Promise<ProjectTreeEntry[]> => {
       const files = await this.listJsonFiles(dir);
       const entries: ProjectTreeEntry[] = [];
       for (const f of files) {
@@ -337,19 +426,21 @@ export class ProjectStore {
           if (statusKey) entry.status = String((data as any)[statusKey] ?? '');
           if (titleKey) entry.title = String((data as any)[titleKey] ?? '');
           entries.push(entry);
-        } catch { /* skip */ }
+        } catch (err: any) {
+          this.corruptedFiles.push({ path: f, entityType, error: err?.message ?? String(err) });
+        }
       }
       return entries;
     };
     const [features, techSpecs, research, plans, tasks, decisions, risks, milestones] = await Promise.all([
-      readEntries<Feature>(this.featuresDir(projectName), 'name', 'status'),
-      readEntries<TechSpec>(this.techSpecsDir(projectName), 'name'),
-      readEntries<ResearchSession>(this.researchDir(projectName), 'sessionName'),
-      readEntries<Plan>(this.plansDir(projectName), 'name', 'status'),
-      readEntries<Task>(this.tasksDir(projectName), 'name', 'status'),
-      readEntries<Decision>(this.decisionsDir(projectName), 'title', 'status', 'title'),
-      readEntries<Risk>(this.risksDir(projectName), 'title', 'status', 'title'),
-      readEntries<Milestone>(this.milestonesDir(projectName), 'name', 'status'),
+      readEntries<Feature>(this.featuresDir(projectName), 'name', 'feature', 'status'),
+      readEntries<TechSpec>(this.techSpecsDir(projectName), 'name', 'techspec'),
+      readEntries<ResearchSession>(this.researchDir(projectName), 'sessionName', 'research'),
+      readEntries<Plan>(this.plansDir(projectName), 'name', 'plan', 'status'),
+      readEntries<Task>(this.tasksDir(projectName), 'name', 'task', 'status'),
+      readEntries<Decision>(this.decisionsDir(projectName), 'title', 'decision', 'status', 'title'),
+      readEntries<Risk>(this.risksDir(projectName), 'title', 'risk', 'status', 'title'),
+      readEntries<Milestone>(this.milestonesDir(projectName), 'name', 'milestone', 'status'),
     ]);
     const tags = await this.readTags(projectName).catch(() => [] as Tag[]);
     const activityFiles = await this.listJsonFiles(this.activityDir(projectName));
@@ -410,16 +501,12 @@ export class ProjectStore {
 
   async listFeatures(projectName: string): Promise<Feature[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.featuresDir(projectName));
-    const features: Feature[] = [];
-    for (const f of files) { try { features.push(await this.readJson<Feature>(f)); } catch { /* skip */ } }
-    return features;
+    this.resetCorrupted();
+    return this.readJsonFiles<Feature>(this.featuresDir(projectName), 'feature');
   }
 
   async getFeature(projectName: string, featureName: string): Promise<Feature> {
-    const f = await this.readJson<Feature>(this.featurePath(projectName, featureName));
-    if (!f) throw new McpError(ErrorCode.InvalidParams, `Feature "${featureName}" not found in project "${projectName}"`);
-    return f;
+    return this.readJson<Feature>(this.featurePath(projectName, featureName));
   }
 
   async updateFeature(projectName: string, featureName: string, updates: Partial<Pick<Feature, 'description' | 'priority' | 'status' | 'dependencies'>>): Promise<Feature> {
@@ -460,10 +547,8 @@ export class ProjectStore {
 
   async listTechSpecs(projectName: string): Promise<TechSpec[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.techSpecsDir(projectName));
-    const specs: TechSpec[] = [];
-    for (const f of files) { try { specs.push(await this.readJson<TechSpec>(f)); } catch { /* skip */ } }
-    return specs;
+    this.resetCorrupted();
+    return this.readJsonFiles<TechSpec>(this.techSpecsDir(projectName), 'techspec');
   }
 
   async getTechSpec(projectName: string, techSpecName: string): Promise<TechSpec> {
@@ -506,10 +591,8 @@ export class ProjectStore {
 
   async listResearch(projectName: string): Promise<ResearchSession[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.researchDir(projectName));
-    const sessions: ResearchSession[] = [];
-    for (const f of files) { try { sessions.push(await this.readJson<ResearchSession>(f)); } catch { /* skip */ } }
-    return sessions;
+    this.resetCorrupted();
+    return this.readJsonFiles<ResearchSession>(this.researchDir(projectName), 'research');
   }
 
   async getResearch(projectName: string, sessionName: string): Promise<ResearchSession> {
@@ -552,10 +635,8 @@ export class ProjectStore {
 
   async listPlans(projectName: string): Promise<Plan[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.plansDir(projectName));
-    const plans: Plan[] = [];
-    for (const f of files) { try { plans.push(await this.readJson<Plan>(f)); } catch { /* skip */ } }
-    return plans;
+    this.resetCorrupted();
+    return this.readJsonFiles<Plan>(this.plansDir(projectName), 'plan');
   }
 
   async getPlan(projectName: string, planName: string): Promise<Plan | null> {
@@ -606,10 +687,8 @@ export class ProjectStore {
 
   async listTasks(projectName: string): Promise<Task[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.tasksDir(projectName));
-    const tasks: Task[] = [];
-    for (const f of files) { try { tasks.push(await this.readJson<Task>(f)); } catch { /* skip */ } }
-    return tasks;
+    this.resetCorrupted();
+    return this.readJsonFiles<Task>(this.tasksDir(projectName), 'task');
   }
 
   async getTask(projectName: string, taskName: string): Promise<Task | null> {
@@ -659,24 +738,36 @@ export class ProjectStore {
 
   // -- Bulk Operations -----------------------------------------------------
 
-  async bulkCreateTasks(projectName: string, tasks: Array<{ name: string; description: string; priority?: Task['priority']; dependencies?: string[]; planId?: string }>): Promise<Task[]> {
-    const created: Task[] = [];
-    for (const t of tasks) {
-      created.push(await this.createTask(projectName, t.name, t.description, t.priority, t.dependencies ?? [], t.planId ?? ''));
+  async bulkCreateTasks(projectName: string, tasks: Array<{ name: string; description: string; priority?: Task['priority']; dependencies?: string[]; planId?: string }>): Promise<BulkResult<Task>> {
+    const succeeded: Task[] = [];
+    const errors: Array<{ index: number; name: string; error: string }> = [];
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i];
+      try {
+        succeeded.push(await this.createTask(projectName, t.name, t.description, t.priority, t.dependencies ?? [], t.planId ?? ''));
+      } catch (err: any) {
+        errors.push({ index: i, name: t.name, error: err?.message ?? String(err) });
+      }
     }
-    return created;
+    return { succeeded, errors };
   }
 
-  async bulkUpdateTasks(projectName: string, updates: Array<{ name: string; status?: Task['status']; assignedTo?: string; priority?: Task['priority'] }>): Promise<Task[]> {
-    const results: Task[] = [];
-    for (const u of updates) {
-      const taskUpdates: Partial<Pick<Task, 'status' | 'assignedTo' | 'priority'>> = {};
-      if (u.status !== undefined) taskUpdates.status = u.status;
-      if (u.assignedTo !== undefined) taskUpdates.assignedTo = u.assignedTo;
-      if (u.priority !== undefined) taskUpdates.priority = u.priority;
-      results.push(await this.updateTask(projectName, u.name, taskUpdates));
+  async bulkUpdateTasks(projectName: string, updates: Array<{ name: string; status?: Task['status']; assignedTo?: string; priority?: Task['priority'] }>): Promise<BulkResult<Task>> {
+    const succeeded: Task[] = [];
+    const errors: Array<{ index: number; name: string; error: string }> = [];
+    for (let i = 0; i < updates.length; i++) {
+      const u = updates[i];
+      try {
+        const taskUpdates: Partial<Pick<Task, 'status' | 'assignedTo' | 'priority'>> = {};
+        if (u.status !== undefined) taskUpdates.status = u.status;
+        if (u.assignedTo !== undefined) taskUpdates.assignedTo = u.assignedTo;
+        if (u.priority !== undefined) taskUpdates.priority = u.priority;
+        succeeded.push(await this.updateTask(projectName, u.name, taskUpdates));
+      } catch (err: any) {
+        errors.push({ index: i, name: u.name, error: err?.message ?? String(err) });
+      }
     }
-    return results;
+    return { succeeded, errors };
   }
 
   // -- Decisions -----------------------------------------------------------
@@ -693,10 +784,8 @@ export class ProjectStore {
 
   async listDecisions(projectName: string): Promise<Decision[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.decisionsDir(projectName));
-    const decisions: Decision[] = [];
-    for (const f of files) { try { decisions.push(await this.readJson<Decision>(f)); } catch { /* skip */ } }
-    return decisions;
+    this.resetCorrupted();
+    return this.readJsonFiles<Decision>(this.decisionsDir(projectName), 'decision');
   }
 
   async getDecision(projectName: string, title: string): Promise<Decision> {
@@ -761,10 +850,8 @@ export class ProjectStore {
 
   async listRisks(projectName: string): Promise<Risk[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.risksDir(projectName));
-    const risks: Risk[] = [];
-    for (const f of files) { try { risks.push(await this.readJson<Risk>(f)); } catch { /* skip */ } }
-    return risks;
+    this.resetCorrupted();
+    return this.readJsonFiles<Risk>(this.risksDir(projectName), 'risk');
   }
 
   async getRisk(projectName: string, title: string): Promise<Risk> {
@@ -830,10 +917,8 @@ export class ProjectStore {
 
   async listMilestones(projectName: string): Promise<Milestone[]> {
     await this.getProject(projectName);
-    const files = await this.listJsonFiles(this.milestonesDir(projectName));
-    const milestones: Milestone[] = [];
-    for (const f of files) { try { milestones.push(await this.readJson<Milestone>(f)); } catch { /* skip */ } }
-    return milestones;
+    this.resetCorrupted();
+    return this.readJsonFiles<Milestone>(this.milestonesDir(projectName), 'milestone');
   }
 
   async getMilestone(projectName: string, name: string): Promise<Milestone> {
@@ -896,6 +981,20 @@ export class ProjectStore {
   }
 
   async importProject(data: ProjectExport, overwriteExisting: boolean = false, importAs?: string): Promise<ProjectMeta> {
+    // Validate structure before writing anything
+    if (!data.project || typeof data.project.name !== 'string') {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid project export: missing or invalid "project" metadata');
+    }
+    const requiredArrays: Array<keyof ProjectExport> = [
+      'features', 'techSpecs', 'research', 'plans', 'tasks',
+      'decisions', 'risks', 'milestones', 'tags', 'tagAssignments', 'activityLog',
+    ];
+    for (const key of requiredArrays) {
+      if (!Array.isArray((data as any)[key])) {
+        throw new McpError(ErrorCode.InvalidParams, `Invalid project export: "${key}" must be an array`);
+      }
+    }
+
     const projectName = importAs ?? data.project.name;
     const projDir = this.projectDir(projectName);
     const metaPath = this.projectMetaPath(projectName);
@@ -951,11 +1050,24 @@ export class ProjectStore {
 
   async validateProject(projectName: string): Promise<ValidationIssue[]> {
     const issues: ValidationIssue[] = [];
+
+    // Report any corrupted files encountered during loading
+    this.resetCorrupted();
     const [features, techSpecs, plans, tasks, decisions, risks, milestones] = await Promise.all([
       this.listFeatures(projectName), this.listTechSpecs(projectName), this.listPlans(projectName),
       this.listTasks(projectName), this.listDecisions(projectName), this.listRisks(projectName),
       this.listMilestones(projectName),
     ]);
+    for (const cf of this.corruptedFiles) {
+      issues.push({
+        severity: 'error',
+        entityType: cf.entityType,
+        entityId: cf.path,
+        entityName: basename(cf.path),
+        field: 'file',
+        message: `Corrupted file: ${cf.error}`,
+      });
+    }
 
     const featureIds = new Set(features.map((f) => f.id));
     const taskIds = new Set(tasks.map((t) => t.id));
@@ -1183,6 +1295,7 @@ export class ProjectStore {
     await this.getProject(projectName);
     const results: SearchResult[] = [];
     const lowerQuery = query.toLowerCase();
+    this.resetCorrupted();
 
     const searchDir = async (dir: string, type: string, nameKey: string, searchFields: string[]) => {
       const files = await this.listJsonFiles(dir);
@@ -1203,7 +1316,9 @@ export class ProjectStore {
             const context = (start > 0 ? '...' : '') + val.slice(start, end) + (end < val.length ? '...' : '');
             results.push({ type, id: data.id ?? '', name: String(name), filePath: relative(this.projectDir(projectName), f), matchContext: `[${matchField}] ${context}` });
           }
-        } catch { /* skip */ }
+        } catch (err: any) {
+          this.corruptedFiles.push({ path: f, entityType: type, error: err?.message ?? String(err) });
+        }
       }
     };
 
@@ -1236,7 +1351,9 @@ export class ProjectStore {
               results.push({ type: 'plan', id: data.id ?? '', name: data.name ?? 'unknown', filePath: relative(this.projectDir(projectName), f), matchContext: `[steps] ${context}` });
             }
           }
-        } catch { /* skip */ }
+        } catch (err: any) {
+          this.corruptedFiles.push({ path: f, entityType: 'plan', error: err?.message ?? String(err) });
+        }
       }
     }
 
