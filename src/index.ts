@@ -915,6 +915,28 @@ class ProjectStore {
     throw new McpError(ErrorCode.InvalidParams, `Task "${taskName}" not found in project "${projectName}"`);
   }
 
+  // -- Bulk Operations -----------------------------------------------------
+
+  async bulkCreateTasks(projectName: string, tasks: Array<{ name: string; description: string; priority?: Task['priority']; dependencies?: string[]; planId?: string }>): Promise<Task[]> {
+    const created: Task[] = [];
+    for (const t of tasks) {
+      created.push(await this.createTask(projectName, t.name, t.description, t.priority, t.dependencies ?? [], t.planId ?? ''));
+    }
+    return created;
+  }
+
+  async bulkUpdateTasks(projectName: string, updates: Array<{ name: string; status?: Task['status']; assignedTo?: string; priority?: Task['priority'] }>): Promise<Task[]> {
+    const results: Task[] = [];
+    for (const u of updates) {
+      const taskUpdates: Partial<Pick<Task, 'status' | 'assignedTo' | 'priority'>> = {};
+      if (u.status !== undefined) taskUpdates.status = u.status;
+      if (u.assignedTo !== undefined) taskUpdates.assignedTo = u.assignedTo;
+      if (u.priority !== undefined) taskUpdates.priority = u.priority;
+      results.push(await this.updateTask(projectName, u.name, taskUpdates));
+    }
+    return results;
+  }
+
   // -- Decisions -----------------------------------------------------------
 
   async addDecision(projectName: string, title: string, context: string, decision: string, rationale: string, consequences: string, options?: string[], tags?: string[], relatedFeatures?: string[]): Promise<Decision> {
@@ -1654,7 +1676,7 @@ class ProjectPlanerServer {
 
   constructor() {
     this.server = new Server(
-      { name: 'project-planer-mcp', version: '0.6.0' },
+      { name: 'project-planer-mcp', version: '0.7.0' },
       { capabilities: { tools: {} } }
     );
     this.setupToolHandlers();
@@ -1705,6 +1727,8 @@ class ProjectPlanerServer {
         { name: 'update_task', description: "Update a task's fields", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] }, status: { type: 'string', enum: ['pending', 'in-progress', 'completed', 'blocked'] }, assignedTo: { type: 'string' }, dependencies: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'taskName'] } },
         { name: 'assign_task', description: 'Assign a task', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' }, assignee: { type: 'string' } }, required: ['projectName', 'taskName', 'assignee'] } },
         { name: 'delete_task', description: 'Delete a task', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' } }, required: ['projectName', 'taskName'] } },
+        { name: 'bulk_create_tasks', description: 'Create multiple tasks in a single call', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, tasks: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] }, dependencies: { type: 'array', items: { type: 'string' } }, planId: { type: 'string' } }, required: ['name', 'description'] } } }, required: ['projectName', 'tasks'] } },
+        { name: 'bulk_update_tasks', description: 'Update status, assignee, or priority on multiple tasks at once', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, updates: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, status: { type: 'string', enum: ['pending', 'in-progress', 'completed', 'blocked'] }, assignedTo: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] } }, required: ['name'] } } }, required: ['projectName', 'updates'] } },
 
         { name: 'add_decision', description: 'Add an architecture decision record (ADR)', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' }, context: { type: 'string' }, decision: { type: 'string' }, rationale: { type: 'string' }, consequences: { type: 'string' }, options: { type: 'array', items: { type: 'string' } }, tags: { type: 'array', items: { type: 'string' } }, relatedFeatures: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'title', 'context', 'decision', 'rationale', 'consequences'] } },
         { name: 'list_decisions', description: 'List all decision records', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
@@ -1790,6 +1814,8 @@ class ProjectPlanerServer {
           case 'update_task': return await this.handleUpdateTask(a);
           case 'assign_task': return await this.handleAssignTask(a);
           case 'delete_task': return await this.handleDeleteTask(a);
+          case 'bulk_create_tasks': return await this.handleBulkCreateTasks(a);
+          case 'bulk_update_tasks': return await this.handleBulkUpdateTasks(a);
 
           case 'add_decision': return await this.handleAddDecision(a);
           case 'list_decisions': return await this.handleListDecisions(a);
@@ -1917,6 +1943,9 @@ class ProjectPlanerServer {
   private async handleAssignTask(args: Record<string, unknown>) { return textResponse(await store.assignTask(getString(args, 'projectName'), getString(args, 'taskName'), getString(args, 'assignee'))); }
   private async handleDeleteTask(args: Record<string, unknown>) { await store.deleteTask(getString(args, 'projectName'), getString(args, 'taskName')); return textResponse({ deleted: true }); }
 
+  private async handleBulkCreateTasks(args: Record<string, unknown>) { return textResponse(await store.bulkCreateTasks(getString(args, 'projectName'), args.tasks as any[])); }
+  private async handleBulkUpdateTasks(args: Record<string, unknown>) { return textResponse(await store.bulkUpdateTasks(getString(args, 'projectName'), args.updates as any[])); }
+
   private async handleAddDecision(args: Record<string, unknown>) { return textResponse(await store.addDecision(getString(args, 'projectName'), getString(args, 'title'), getString(args, 'context'), getString(args, 'decision'), getString(args, 'rationale'), getString(args, 'consequences'), getStringArray(args, 'options'), getStringArray(args, 'tags'), getStringArray(args, 'relatedFeatures'))); }
   private async handleListDecisions(args: Record<string, unknown>) { return textResponse(await store.listDecisions(getString(args, 'projectName'))); }
   private async handleGetDecision(args: Record<string, unknown>) { return textResponse(await store.getDecision(getString(args, 'projectName'), getString(args, 'title'))); }
@@ -2001,7 +2030,7 @@ class ProjectPlanerServer {
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Project Planer MCP server v0.6.0 running on stdio');
+    console.error('Project Planer MCP server v0.7.0 running on stdio');
   }
 }
 
