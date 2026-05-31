@@ -25,6 +25,8 @@ project-planer-mcp/
         │   └── decision-title-YYYYMMDD-HHMMSS.json  # Architecture Decision Records
         ├── Risks/
         │   └── risk-title-YYYYMMDD-HHMMSS.json       # Risk register entries
+        ├── Milestones/
+        │   └── milestone-name-YYYYMMDD-HHMMSS.json   # Time-boxed milestones
         ├── Tags/
         │   ├── index.json                            # Tag definitions
         │   └── assignments.json                      # Tag-to-entity mappings
@@ -324,6 +326,48 @@ Delete a decision record from a project.
 - **projectName** (string, required) — Name of the project
 - **title** (string, required) — Title of the decision to delete
 
+### Milestone Tools
+
+#### `add_milestone`
+Add a milestone with a due date to a project.
+
+- **projectName** (string, required) — Name of the project
+- **name** (string, required) — Name of the milestone
+- **description** (string, required) — Description of the milestone
+- **dueDate** (string, required) — ISO date string (e.g. `2026-06-30`)
+- **featureIds** (string[], optional) — IDs of features this milestone covers
+- **planIds** (string[], optional) — IDs of plans this milestone references
+- **taskIds** (string[], optional) — IDs of tasks this milestone references
+
+#### `list_milestones`
+List all milestones for a project.
+
+- **projectName** (string, required) — Name of the project
+
+#### `get_milestone`
+Get a single milestone by name.
+
+- **projectName** (string, required) — Name of the project
+- **name** (string, required) — Name of the milestone
+
+#### `update_milestone`
+Update a milestone's fields or status.
+
+- **projectName** (string, required) — Name of the project
+- **name** (string, required) — Name of the milestone
+- **description** (string, optional) — New description
+- **dueDate** (string, optional) — New due date
+- **status** (enum: `planned`, `in-progress`, `completed`, `overdue`, optional)
+- **featureIds** (string[], optional) — Updated feature IDs
+- **planIds** (string[], optional) — Updated plan IDs
+- **taskIds** (string[], optional) — Updated task IDs
+
+#### `delete_milestone`
+Delete a milestone from a project.
+
+- **projectName** (string, required) — Name of the project
+- **name** (string, required) — Name of the milestone to delete
+
 ### Risk Register Tools
 
 #### `add_risk`
@@ -467,10 +511,22 @@ Create a new project seeded from an existing project's structure. Copies feature
 - **newDescription** (string, optional) — Description for the new project
 - **copyTasks** (boolean, optional) — Also copy tasks (reset to pending, unassigned)
 
+### Validation & Export Tools
+
+#### `validate_project`
+Check a project for broken cross-entity references. Scans all entities and reports issues like broken feature dependencies, orphaned techspecs, tasks referencing deleted plans, and milestone references to non-existent entities.
+
+- **projectName** (string, required) — Name of the project
+
+#### `export_markdown`
+Export a project as a formatted Markdown document suitable for sharing, README files, or documentation sites. Includes summary tables, ADR sections, risk register, milestone timeline, task board grouped by status, and more.
+
+- **projectName** (string, required) — Name of the project
+
 ### Advanced Tools
 
 #### `search_project`
-Full-text search across all entities (features, techspecs, research, plans, tasks, decisions, risks) in a project.
+Full-text search across all entities (features, techspecs, research, plans, tasks, decisions, risks, milestones) in a project.
 
 - **projectName** (string, required) — Name of the project
 - **query** (string, required) — Search query string (case-insensitive)
