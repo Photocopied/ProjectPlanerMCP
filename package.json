@@ -1,7 +1,7 @@
 {
   "name": "project-planer-mcp",
-  "version": "0.1.0",
-  "description": "MCP server for project planning - create and manage project plans with tasks",
+  "version": "0.3.0",
+  "description": "MCP server for rich project planning with features, techspecs, research, plans, and tasks",
   "type": "module",
   "bin": {
     "project-planer-mcp": "./build/index.js"
@@ -22,9 +22,11 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.13.1"
+    "@modelcontextprotocol/sdk": "^1.13.1",
+    "env-paths": "^4.0.0"
   },
   "devDependencies": {
+    "@types/env-paths": "^1.0.2",
     "@types/node": "^22.14.1",
     "typescript": "^5.8.3"
   }
