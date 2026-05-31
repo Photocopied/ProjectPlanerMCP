@@ -19,8 +19,17 @@ project-planer-mcp/
         │   └── research-session-YYYYMMDD-HHMMSS.json
         ├── Plans/
         │   └── plan-name-YYYYMMDD-HHMMSS.json
-        └── Tasks/
-            └── task-name-YYYYMMDD-HHMMSS.json
+        ├── Tasks/
+        │   └── task-name-YYYYMMDD-HHMMSS.json
+        ├── Decisions/
+        │   └── decision-title-YYYYMMDD-HHMMSS.json  # Architecture Decision Records
+        ├── Risks/
+        │   └── risk-title-YYYYMMDD-HHMMSS.json       # Risk register entries
+        ├── Tags/
+        │   ├── index.json                            # Tag definitions
+        │   └── assignments.json                      # Tag-to-entity mappings
+        └── Activity/
+            └── activity-entity-YYYYMMDD-HHMMSS.json  # Audit log entries
 ```
 
 ### Data Flow
@@ -28,11 +37,17 @@ project-planer-mcp/
 ```
 Features (capabilities)
     ↕ referenced by
-TechSpecs (technical approach)
-    ↕ referenced by
-Plans (implementation strategy)
-    ↕ referenced by
-Tasks (executable work items)
+TechSpecs (technical approach) ── tagged with ── Tags (cross-cutting labels)
+    ↕ referenced by                ↕
+Plans (implementation strategy)    ↕
+    ↕ referenced by                ↕
+Tasks (executable work items)      ↕
+    ↕                              ↕
+Decisions (architectural rationale)─↕
+    ↕                              ↕
+Risks (uncertainty & mitigation) ─ ↕
+
+Activity Log (audit trail) ← every mutation records a timestamped entry
 ```
 
 ## Tools
@@ -262,16 +277,181 @@ Delete a task from a project.
 - **projectName** (string, required) — Name of the project
 - **taskName** (string, required) — Name of the task to delete
 
+### Decision Record Tools
+
+#### `add_decision`
+Add an architecture decision record (ADR) to document why a technical decision was made.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the decision
+- **context** (string, required) — Background and constraints leading to this decision
+- **decision** (string, required) — What was decided
+- **rationale** (string, required) — Why this approach was chosen
+- **consequences** (string, required) — Trade-offs and consequences accepted
+- **options** (string[], optional) — Alternatives considered
+- **tags** (string[], optional) — Tag names to associate
+- **relatedFeatures** (string[], optional) — Related feature IDs
+
+#### `list_decisions`
+List all decision records for a project.
+
+- **projectName** (string, required) — Name of the project
+
+#### `get_decision`
+Get a single decision record by title.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the decision
+
+#### `update_decision`
+Update a decision record's fields or status.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the decision
+- **context** (string, optional) — Updated context
+- **options** (string[], optional) — Updated alternatives considered
+- **decision** (string, optional) — Updated decision
+- **rationale** (string, optional) — Updated rationale
+- **consequences** (string, optional) — Updated consequences
+- **status** (enum: `proposed`, `accepted`, `deprecated`, `superseded`, optional)
+- **supersededBy** (string, optional) — ID of the decision that supersedes this one
+- **tags** (string[], optional) — Updated tag names
+- **relatedFeatures** (string[], optional) — Updated related feature IDs
+
+#### `delete_decision`
+Delete a decision record from a project.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the decision to delete
+
+### Risk Register Tools
+
+#### `add_risk`
+Add a risk entry to the project risk register. Severity is automatically computed as likelihood × impact.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the risk
+- **description** (string, required) — Detailed description of the risk
+- **category** (enum: `technical`, `schedule`, `people`, `external`, `budget`, `other`, required)
+- **likelihood** (number, required) — Rating 1 (almost never) to 5 (certain)
+- **impact** (number, required) — Rating 1 (negligible) to 5 (catastrophic)
+- **mitigation** (string, optional) — Mitigation strategy
+- **contingency** (string, optional) — Contingency plan
+- **owner** (string, optional) — Risk owner
+- **tags** (string[], optional) — Tag names to associate
+- **relatedFeatures** (string[], optional) — Related feature IDs
+
+#### `list_risks`
+List all risks for a project.
+
+- **projectName** (string, required) — Name of the project
+
+#### `get_risk`
+Get a single risk by title.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the risk
+
+#### `update_risk`
+Update a risk's fields or status. When likelihood or impact changes, severity is automatically recalculated.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the risk
+- **description** (string, optional) — Updated description
+- **category** (enum: `technical`, `schedule`, `people`, `external`, `budget`, `other`, optional)
+- **likelihood** (number, optional) — Updated likelihood rating (1–5)
+- **impact** (number, optional) — Updated impact rating (1–5)
+- **status** (enum: `identified`, `mitigating`, `materialized`, `closed`, optional)
+- **mitigation** (string, optional) — Updated mitigation strategy
+- **contingency** (string, optional) — Updated contingency plan
+- **owner** (string, optional) — Updated risk owner
+- **tags** (string[], optional) — Updated tag names
+- **relatedFeatures** (string[], optional) — Updated related feature IDs
+
+#### `delete_risk`
+Delete a risk from the project.
+
+- **projectName** (string, required) — Name of the project
+- **title** (string, required) — Title of the risk to delete
+
+### Tag Tools
+
+#### `add_tag`
+Create a new tag for cross-cutting categorization across all entity types.
+
+- **projectName** (string, required) — Name of the project
+- **name** (string, required) — Tag name (must be unique within the project)
+- **color** (string, optional) — Hex color (e.g. `#ff6600`). Auto-generated if omitted.
+- **description** (string, optional) — Description of the tag
+
+#### `list_tags`
+List all tags with their assignment counts for a project.
+
+- **projectName** (string, required) — Name of the project
+
+#### `remove_tag`
+Delete a tag and remove all its assignments from entities.
+
+- **projectName** (string, required) — Name of the project
+- **name** (string, required) — Name of the tag to delete
+
+#### `assign_tag`
+Assign a tag to an entity (feature, techspec, research session, plan, task, decision, or risk).
+
+- **projectName** (string, required) — Name of the project
+- **tagName** (string, required) — Name of the tag
+- **targetType** (enum: `feature`, `techspec`, `research`, `plan`, `task`, `decision`, `risk`, required) — Entity type
+- **targetId** (string, required) — ID of the entity to tag
+
+#### `unassign_tag`
+Remove a tag from an entity.
+
+- **projectName** (string, required) — Name of the project
+- **tagName** (string, required) — Name of the tag
+- **targetType** (enum: `feature`, `techspec`, `research`, `plan`, `task`, `decision`, `risk`, required) — Entity type
+- **targetId** (string, required) — ID of the entity
+
+#### `search_by_tag`
+Find all entity assignments for a given tag.
+
+- **projectName** (string, required) — Name of the project
+- **tagName** (string, required) — Name of the tag
+
+### Activity Log Tools
+
+#### `project_activity`
+List activity log entries for a project, optionally filtered by entity type, action, entity ID, or count limit.
+
+- **projectName** (string, required) — Name of the project
+- **entityType** (enum: `project`, `feature`, `techspec`, `research`, `plan`, `task`, `decision`, `risk`, `tag`, optional) — Filter by entity type
+- **action** (enum: `created`, `updated`, `deleted`, `status_changed`, `reassigned`, `tagged`, `untagged`, optional) — Filter by action type
+- **entityId** (string, optional) — Filter by specific entity ID
+- **limit** (number, optional) — Maximum number of entries to return
+
+### Export / Import Tools
+
+#### `export_project`
+Export an entire project as a portable JSON bundle containing all entities, tags, assignments, and activity history.
+
+- **projectName** (string, required) — Name of the project
+
+#### `import_project`
+Import a project from a previously exported JSON bundle. Automatically remaps all IDs to avoid collisions.
+
+- **projectExport** (object, required) — The project export JSON object (from `export_project`)
+- **importAs** (string, optional) — New name for the imported project (defaults to original name)
+- **overwriteExisting** (boolean, optional) — Overwrite if project already exists (default: `false`)
+
 ### Advanced Tools
 
 #### `search_project`
-Full-text search across all entities (features, techspecs, research, plans, tasks) in a project. Searches names, descriptions, details, steps, findings, and more.
+Full-text search across all entities (features, techspecs, research, plans, tasks, decisions, risks) in a project.
 
 - **projectName** (string, required) — Name of the project
 - **query** (string, required) — Search query string (case-insensitive)
 
 #### `project_summary`
-Generate a comprehensive summary of a project including counts and breakdowns by status and priority for features, plans, and tasks.
+Generate a comprehensive summary of a project including counts and breakdowns by status and priority for features, plans, tasks, decisions, risks, and tags.
 
 - **projectName** (string, required) — Name of the project
 

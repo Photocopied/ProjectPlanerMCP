@@ -12,7 +12,6 @@ import envPaths from 'env-paths';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, relative, basename, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -83,14 +82,95 @@ interface Task {
   updatedAt: string;
 }
 
+// New: Decision Record (ADR)
+interface Decision {
+  id: string;
+  title: string;
+  context: string;
+  options: string[];
+  decision: string;
+  rationale: string;
+  consequences: string;
+  status: 'proposed' | 'accepted' | 'deprecated' | 'superseded';
+  supersededBy: string; // Decision ID (empty if not superseded)
+  tags: string[];
+  relatedFeatures: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// New: Risk Register
+interface Risk {
+  id: string;
+  title: string;
+  description: string;
+  category: 'technical' | 'schedule' | 'people' | 'external' | 'budget' | 'other';
+  likelihood: 1 | 2 | 3 | 4 | 5;
+  impact: 1 | 2 | 3 | 4 | 5;
+  severity: number; // computed: likelihood * impact
+  status: 'identified' | 'mitigating' | 'materialized' | 'closed';
+  mitigation: string;
+  contingency: string;
+  owner: string;
+  tags: string[];
+  relatedFeatures: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// New: Tag
+interface Tag {
+  id: string;
+  name: string;
+  color: string; // hex color e.g. "#ff6600"
+  description: string;
+  createdAt: string;
+}
+
+// New: Tag assignment
+interface TagAssignment {
+  tagId: string;
+  targetType: 'feature' | 'techspec' | 'research' | 'plan' | 'task' | 'decision' | 'risk';
+  targetId: string;
+}
+
+// New: Activity Log entry
+interface ActivityLogEntry {
+  id: string;
+  entityType: 'project' | 'feature' | 'techspec' | 'research' | 'plan' | 'task' | 'decision' | 'risk' | 'tag';
+  entityId: string;
+  entityName: string;
+  action: 'created' | 'updated' | 'deleted' | 'status_changed' | 'reassigned' | 'tagged' | 'untagged';
+  details: string;
+  timestamp: string;
+}
+
+// New: Export bundle
+interface ProjectExport {
+  exportVersion: string;
+  exportedAt: string;
+  sourceHost: string;
+  project: ProjectMeta;
+  features: Feature[];
+  techSpecs: TechSpec[];
+  research: ResearchSession[];
+  plans: Plan[];
+  tasks: Task[];
+  decisions: Decision[];
+  risks: Risk[];
+  tags: Tag[];
+  tagAssignments: TagAssignment[];
+  activityLog: ActivityLogEntry[];
+}
+
 // For dependency graph output
 interface DependencyNode {
   id: string;
   name: string;
   type: 'feature' | 'task';
   status: string;
-  dependsOn: string[]; // IDs of things this depends on
-  dependedBy: string[]; // IDs of things that depend on this
+  dependsOn: string[];
+  dependedBy: string[];
 }
 
 // For project summary output
@@ -106,6 +186,12 @@ interface ProjectSummary {
   taskCount: number;
   tasksByStatus: Record<string, number>;
   tasksByPriority: Record<string, number>;
+  decisionCount: number;
+  decisionsByStatus: Record<string, number>;
+  riskCount: number;
+  risksBySeverity: Record<string, number>;
+  risksByCategory: Record<string, number>;
+  tagCount: number;
 }
 
 // For search results
@@ -133,25 +219,41 @@ function now(): string {
 
 /**
  * Sanitize a string so it can be used safely as a directory/file name.
- * Replaces anything that isn't alphanumeric, dash, or underscore.
  */
 function sanitizeName(name: string): string {
   return name
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '') // strip combining marks
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .replace(/_+/g, '_')
     .replace(/^_|_$/g, '');
 }
 
 /**
- * Build a timestamped filename in the format used for research, plans, and tasks:
+ * Build a timestamped filename in the format used for time-based entities:
  *   {prefix}-{sanitized name}-{ISO-ish suffix}.json
  */
 function timestampedFilename(prefix: string, name: string): string {
   const safe = sanitizeName(name);
   const ts = now().replace(/[:.]/g, '').replace('T', '-').slice(0, 15);
   return `${prefix}-${safe}-${ts}.json`;
+}
+
+/**
+ * Default color palette for auto-generated tags.
+ */
+function tagColorFromName(name: string): string {
+  const colors = [
+    '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
+    '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4',
+    '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000',
+    '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9',
+  ];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return colors[Math.abs(hash) % colors.length];
 }
 
 // ---------------------------------------------------------------------------
@@ -168,12 +270,10 @@ class ProjectStore {
 
   // -- Project directory helpers -------------------------------------------
 
-  /** Project directory, e.g. ~/.../projects/MyProject */
   private projectDir(projectName: string): string {
     return join(this.projectsDir, sanitizeName(projectName));
   }
 
-  /** Project.json path */
   private projectMetaPath(projectName: string): string {
     return join(this.projectDir(projectName), 'Project.json');
   }
@@ -196,6 +296,30 @@ class ProjectStore {
 
   private tasksDir(projectName: string): string {
     return join(this.projectDir(projectName), 'Tasks');
+  }
+
+  private decisionsDir(projectName: string): string {
+    return join(this.projectDir(projectName), 'Decisions');
+  }
+
+  private risksDir(projectName: string): string {
+    return join(this.projectDir(projectName), 'Risks');
+  }
+
+  private tagsDir(projectName: string): string {
+    return join(this.projectDir(projectName), 'Tags');
+  }
+
+  private tagsIndexPath(projectName: string): string {
+    return join(this.tagsDir(projectName), 'index.json');
+  }
+
+  private tagAssignmentsPath(projectName: string): string {
+    return join(this.tagsDir(projectName), 'assignments.json');
+  }
+
+  private activityDir(projectName: string): string {
+    return join(this.projectDir(projectName), 'Activity');
   }
 
   // -- Low-level file helpers ----------------------------------------------
@@ -223,42 +347,199 @@ class ProjectStore {
     }
   }
 
-  /**
-   * Find files matching a predicate by scanning all JSON in a directory
-   * and returning the first match together with its file path.
-   */
-  private async findJsonFile<T>(
-    dir: string,
-    predicate: (item: T) => boolean
-  ): Promise<{ data: T; filePath: string } | null> {
-    const files = await this.listJsonFiles(dir);
+  // -- Activity Log --------------------------------------------------------
+
+  async logActivity(
+    projectName: string,
+    entityType: ActivityLogEntry['entityType'],
+    entityId: string,
+    entityName: string,
+    action: ActivityLogEntry['action'],
+    details: string
+  ): Promise<void> {
+    const entry: ActivityLogEntry = {
+      id: generateId(),
+      entityType,
+      entityId,
+      entityName,
+      action,
+      details,
+      timestamp: now(),
+    };
+    const filename = timestampedFilename('activity', entityName);
+    const aPath = join(this.activityDir(projectName), filename);
+    await this.writeJson(aPath, entry);
+  }
+
+  async listActivity(
+    projectName: string,
+    filters?: {
+      entityType?: ActivityLogEntry['entityType'];
+      action?: ActivityLogEntry['action'];
+      entityId?: string;
+      limit?: number;
+    }
+  ): Promise<ActivityLogEntry[]> {
+    await this.getProject(projectName);
+    const files = await this.listJsonFiles(this.activityDir(projectName));
+    const entries: ActivityLogEntry[] = [];
     for (const f of files) {
       try {
-        const data = await this.readJson<T>(f);
-        if (predicate(data)) {
-          return { data, filePath: f };
-        }
+        const e = await this.readJson<ActivityLogEntry>(f);
+        if (filters?.entityType && e.entityType !== filters.entityType) continue;
+        if (filters?.action && e.action !== filters.action) continue;
+        if (filters?.entityId && e.entityId !== filters.entityId) continue;
+        entries.push(e);
       } catch {
         // skip corrupt files
       }
     }
-    return null;
+    // Newest first
+    entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    if (filters?.limit && filters.limit > 0) {
+      return entries.slice(0, filters.limit);
+    }
+    return entries;
+  }
+
+  // -- Tags ----------------------------------------------------------------
+
+  private async ensureTagsIndex(projectName: string): Promise<void> {
+    const idxPath = this.tagsIndexPath(projectName);
+    if (!existsSync(idxPath)) {
+      await this.writeJson(idxPath, []);
+    }
+  }
+
+  private async ensureTagAssignments(projectName: string): Promise<void> {
+    const aPath = this.tagAssignmentsPath(projectName);
+    if (!existsSync(aPath)) {
+      await this.writeJson(aPath, []);
+    }
+  }
+
+  private async readTags(projectName: string): Promise<Tag[]> {
+    await this.ensureTagsIndex(projectName);
+    return this.readJson<Tag[]>(this.tagsIndexPath(projectName));
+  }
+
+  private async writeTags(projectName: string, tags: Tag[]): Promise<void> {
+    await this.writeJson(this.tagsIndexPath(projectName), tags);
+  }
+
+  private async readTagAssignments(projectName: string): Promise<TagAssignment[]> {
+    await this.ensureTagAssignments(projectName);
+    return this.readJson<TagAssignment[]>(this.tagAssignmentsPath(projectName));
+  }
+
+  private async writeTagAssignments(projectName: string, assignments: TagAssignment[]): Promise<void> {
+    await this.writeJson(this.tagAssignmentsPath(projectName), assignments);
+  }
+
+  async addTag(projectName: string, name: string, color?: string, description?: string): Promise<Tag> {
+    await this.getProject(projectName);
+    const tags = await this.readTags(projectName);
+    if (tags.some((t) => t.name.toLowerCase() === name.toLowerCase())) {
+      throw new McpError(ErrorCode.InvalidParams, `Tag "${name}" already exists in project "${projectName}"`);
+    }
+    const tag: Tag = {
+      id: generateId(),
+      name,
+      color: color ?? tagColorFromName(name),
+      description: description ?? '',
+      createdAt: now(),
+    };
+    tags.push(tag);
+    await this.writeTags(projectName, tags);
+    await this.logActivity(projectName, 'tag', tag.id, tag.name, 'created', `Created tag "${tag.name}" with color ${tag.color}`);
+    return tag;
+  }
+
+  async listTags(projectName: string): Promise<(Tag & { assignmentCount: number })[]> {
+    await this.getProject(projectName);
+    const tags = await this.readTags(projectName);
+    const assignments = await this.readTagAssignments(projectName);
+    return tags.map((t) => ({
+      ...t,
+      assignmentCount: assignments.filter((a) => a.tagId === t.id).length,
+    }));
+  }
+
+  async removeTag(projectName: string, tagName: string): Promise<void> {
+    const tags = await this.readTags(projectName);
+    const idx = tags.findIndex((t) => t.name.toLowerCase() === tagName.toLowerCase());
+    if (idx === -1) {
+      throw new McpError(ErrorCode.InvalidParams, `Tag "${tagName}" not found in project "${projectName}"`);
+    }
+    const [removed] = tags.splice(idx, 1);
+    // Remove all assignments for this tag
+    const assignments = await this.readTagAssignments(projectName);
+    const updatedAssignments = assignments.filter((a) => a.tagId !== removed.id);
+    await this.writeTagAssignments(projectName, updatedAssignments);
+    await this.writeTags(projectName, tags);
+    await this.logActivity(projectName, 'tag', removed.id, removed.name, 'deleted', `Deleted tag "${removed.name}" and removed its assignments`);
+  }
+
+  async assignTag(projectName: string, tagName: string, targetType: TagAssignment['targetType'], targetId: string): Promise<void> {
+    const tags = await this.readTags(projectName);
+    const tag = tags.find((t) => t.name.toLowerCase() === tagName.toLowerCase());
+    if (!tag) {
+      throw new McpError(ErrorCode.InvalidParams, `Tag "${tagName}" not found in project "${projectName}"`);
+    }
+    const assignments = await this.readTagAssignments(projectName);
+    if (assignments.some((a) => a.tagId === tag.id && a.targetId === targetId && a.targetType === targetType)) {
+      throw new McpError(ErrorCode.InvalidParams, `Entity is already tagged with "${tagName}"`);
+    }
+    assignments.push({ tagId: tag.id, targetType, targetId });
+    await this.writeTagAssignments(projectName, assignments);
+    await this.logActivity(projectName, 'tag', tag.id, tag.name, 'tagged', `Tagged ${targetType} "${targetId}" with "${tag.name}"`);
+  }
+
+  async unassignTag(projectName: string, tagName: string, targetType: TagAssignment['targetType'], targetId: string): Promise<void> {
+    const tags = await this.readTags(projectName);
+    const tag = tags.find((t) => t.name.toLowerCase() === tagName.toLowerCase());
+    if (!tag) {
+      throw new McpError(ErrorCode.InvalidParams, `Tag "${tagName}" not found in project "${projectName}"`);
+    }
+    const assignments = await this.readTagAssignments(projectName);
+    const idx = assignments.findIndex((a) => a.tagId === tag.id && a.targetId === targetId && a.targetType === targetType);
+    if (idx === -1) {
+      throw new McpError(ErrorCode.InvalidParams, `Entity is not tagged with "${tagName}"`);
+    }
+    assignments.splice(idx, 1);
+    await this.writeTagAssignments(projectName, assignments);
+    await this.logActivity(projectName, 'tag', tag.id, tag.name, 'untagged', `Removed tag "${tag.name}" from ${targetType} "${targetId}"`);
+  }
+
+  async searchByTag(projectName: string, tagName: string): Promise<TagAssignment[]> {
+    const tags = await this.readTags(projectName);
+    const tag = tags.find((t) => t.name.toLowerCase() === tagName.toLowerCase());
+    if (!tag) {
+      throw new McpError(ErrorCode.InvalidParams, `Tag "${tagName}" not found in project "${projectName}"`);
+    }
+    const assignments = await this.readTagAssignments(projectName);
+    return assignments.filter((a) => a.tagId === tag.id);
+  }
+
+  /** Clean up all tag assignments for a given entity (call when entity is deleted). */
+  async cleanTagAssignments(projectName: string, targetType: TagAssignment['targetType'], targetId: string): Promise<void> {
+    const assignments = await this.readTagAssignments(projectName);
+    const filtered = assignments.filter(
+      (a) => !(a.targetType === targetType && a.targetId === targetId)
+    );
+    if (filtered.length !== assignments.length) {
+      await this.writeTagAssignments(projectName, filtered);
+    }
   }
 
   // -- Project -------------------------------------------------------------
 
-  async createProject(
-    name: string,
-    description: string
-  ): Promise<ProjectMeta> {
+  async createProject(name: string, description: string): Promise<ProjectMeta> {
     const projDir = this.projectDir(name);
     const metaPath = this.projectMetaPath(name);
 
     if (existsSync(metaPath)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Project "${name}" already exists`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Project "${name}" already exists`);
     }
 
     const project: ProjectMeta = {
@@ -270,35 +551,35 @@ class ProjectStore {
       updatedAt: now(),
     };
 
-    // Create the scaffold directories
+    // Create the scaffold directories (including new ones)
     await mkdir(join(projDir, 'Features'), { recursive: true });
     await mkdir(join(projDir, 'TechSpecs'), { recursive: true });
     await mkdir(join(projDir, 'Research'), { recursive: true });
     await mkdir(join(projDir, 'Plans'), { recursive: true });
     await mkdir(join(projDir, 'Tasks'), { recursive: true });
+    await mkdir(join(projDir, 'Decisions'), { recursive: true });
+    await mkdir(join(projDir, 'Risks'), { recursive: true });
+    await mkdir(join(projDir, 'Tags'), { recursive: true });
+    await mkdir(join(projDir, 'Activity'), { recursive: true });
 
     await this.writeJson(metaPath, project);
+    await this.logActivity(name, 'project', project.id, project.name, 'created', `Created project "${name}"`);
     return project;
   }
 
   async listProjects(): Promise<ProjectMeta[]> {
     try {
-      const projectDirs = await readdir(this.projectsDir, {
-        withFileTypes: true,
-      });
+      const projectDirs = await readdir(this.projectsDir, { withFileTypes: true });
       const results: ProjectMeta[] = [];
-
       for (const d of projectDirs) {
         if (!d.isDirectory()) continue;
         const metaPath = join(this.projectsDir, d.name, 'Project.json');
         try {
-          const meta = await this.readJson<ProjectMeta>(metaPath);
-          results.push(meta);
+          results.push(await this.readJson<ProjectMeta>(metaPath));
         } catch {
-          // skip directories without a valid Project.json
+          // skip
         }
       }
-
       return results;
     } catch {
       return [];
@@ -308,57 +589,40 @@ class ProjectStore {
   async getProject(name: string): Promise<ProjectMeta> {
     const meta = await this.readJson<ProjectMeta>(this.projectMetaPath(name));
     if (!meta) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Project "${name}" not found`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
     }
     return meta;
   }
 
-  async updateProject(
-    name: string,
-    updates: Partial<Pick<ProjectMeta, 'description' | 'status'>>
-  ): Promise<ProjectMeta> {
+  async updateProject(name: string, updates: Partial<Pick<ProjectMeta, 'description' | 'status'>>): Promise<ProjectMeta> {
     const meta = await this.getProject(name);
     if (updates.description !== undefined) meta.description = updates.description;
     if (updates.status !== undefined) meta.status = updates.status;
     meta.updatedAt = now();
     await this.writeJson(this.projectMetaPath(name), meta);
+    await this.logActivity(name, 'project', meta.id, meta.name, 'updated', `Updated project metadata`);
     return meta;
   }
 
   async deleteProject(name: string): Promise<void> {
     const projDir = this.projectDir(name);
     if (!existsSync(projDir)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Project "${name}" not found`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
     }
     await rm(projDir, { recursive: true, force: true });
   }
 
   // -- Features ------------------------------------------------------------
 
-  /** The file path for a feature inside a project. Features use {name}.json. */
   private featurePath(projectName: string, featureName: string): string {
     return join(this.featuresDir(projectName), `${sanitizeName(featureName)}.json`);
   }
 
-  async addFeature(
-    projectName: string,
-    name: string,
-    description: string,
-    priority: Feature['priority'] = 'medium'
-  ): Promise<Feature> {
-    await this.getProject(projectName); // ensure project exists
+  async addFeature(projectName: string, name: string, description: string, priority: Feature['priority'] = 'medium'): Promise<Feature> {
+    await this.getProject(projectName);
     const fPath = this.featurePath(projectName, name);
     if (existsSync(fPath)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Feature "${name}" already exists in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Feature "${name}" already exists in project "${projectName}"`);
     }
     const feature: Feature = {
       id: generateId(),
@@ -371,6 +635,7 @@ class ProjectStore {
       updatedAt: now(),
     };
     await this.writeJson(fPath, feature);
+    await this.logActivity(projectName, 'feature', feature.id, feature.name, 'created', `Created feature "${name}"`);
     return feature;
   }
 
@@ -379,37 +644,28 @@ class ProjectStore {
     const files = await this.listJsonFiles(this.featuresDir(projectName));
     const features: Feature[] = [];
     for (const f of files) {
-      try {
-        features.push(await this.readJson<Feature>(f));
-      } catch {
-        // skip corrupt files
-      }
+      try { features.push(await this.readJson<Feature>(f)); } catch { /* skip */ }
     }
     return features;
   }
 
   async getFeature(projectName: string, featureName: string): Promise<Feature> {
-    const f = await this.readJson<Feature>(
-      this.featurePath(projectName, featureName)
-    );
+    const f = await this.readJson<Feature>(this.featurePath(projectName, featureName));
     if (!f) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Feature "${featureName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Feature "${featureName}" not found in project "${projectName}"`);
     }
     return f;
   }
 
-  async updateFeature(
-    projectName: string,
-    featureName: string,
-    updates: Partial<Pick<Feature, 'description' | 'priority' | 'status' | 'dependencies'>>
-  ): Promise<Feature> {
+  async updateFeature(projectName: string, featureName: string, updates: Partial<Pick<Feature, 'description' | 'priority' | 'status' | 'dependencies'>>): Promise<Feature> {
     const feature = await this.getFeature(projectName, featureName);
     if (updates.description !== undefined) feature.description = updates.description;
     if (updates.priority !== undefined) feature.priority = updates.priority;
-    if (updates.status !== undefined) feature.status = updates.status;
+    if (updates.status !== undefined) {
+      const oldStatus = feature.status;
+      feature.status = updates.status;
+      await this.logActivity(projectName, 'feature', feature.id, feature.name, 'status_changed', `Status changed from "${oldStatus}" to "${updates.status}"`);
+    }
     if (updates.dependencies !== undefined) feature.dependencies = updates.dependencies;
     feature.updatedAt = now();
     await this.writeJson(this.featurePath(projectName, featureName), feature);
@@ -419,12 +675,12 @@ class ProjectStore {
   async deleteFeature(projectName: string, featureName: string): Promise<void> {
     const fPath = this.featurePath(projectName, featureName);
     if (!existsSync(fPath)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Feature "${featureName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Feature "${featureName}" not found in project "${projectName}"`);
     }
+    const feature = await this.readJson<Feature>(fPath);
     await rm(fPath, { force: true });
+    await this.cleanTagAssignments(projectName, 'feature', feature.id);
+    await this.logActivity(projectName, 'feature', feature.id, feature.name, 'deleted', `Deleted feature "${featureName}"`);
   }
 
   // -- TechSpecs -----------------------------------------------------------
@@ -433,31 +689,15 @@ class ProjectStore {
     return join(this.techSpecsDir(projectName), `${sanitizeName(techSpecName)}.json`);
   }
 
-  async addTechSpec(
-    projectName: string,
-    name: string,
-    description: string,
-    featureId: string,
-    details: string
-  ): Promise<TechSpec> {
+  async addTechSpec(projectName: string, name: string, description: string, featureId: string, details: string): Promise<TechSpec> {
     await this.getProject(projectName);
     const tsPath = this.techSpecPath(projectName, name);
     if (existsSync(tsPath)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `TechSpec "${name}" already exists in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `TechSpec "${name}" already exists in project "${projectName}"`);
     }
-    const spec: TechSpec = {
-      id: generateId(),
-      name,
-      description,
-      featureId,
-      details,
-      createdAt: now(),
-      updatedAt: now(),
-    };
+    const spec: TechSpec = { id: generateId(), name, description, featureId, details, createdAt: now(), updatedAt: now() };
     await this.writeJson(tsPath, spec);
+    await this.logActivity(projectName, 'techspec', spec.id, spec.name, 'created', `Created techspec "${name}"`);
     return spec;
   }
 
@@ -465,75 +705,49 @@ class ProjectStore {
     await this.getProject(projectName);
     const files = await this.listJsonFiles(this.techSpecsDir(projectName));
     const specs: TechSpec[] = [];
-    for (const f of files) {
-      try {
-        specs.push(await this.readJson<TechSpec>(f));
-      } catch {
-        // skip
-      }
-    }
+    for (const f of files) { try { specs.push(await this.readJson<TechSpec>(f)); } catch { /* skip */ } }
     return specs;
   }
 
   async getTechSpec(projectName: string, techSpecName: string): Promise<TechSpec> {
     const tsPath = this.techSpecPath(projectName, techSpecName);
     if (!existsSync(tsPath)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `TechSpec "${techSpecName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `TechSpec "${techSpecName}" not found in project "${projectName}"`);
     }
     return this.readJson<TechSpec>(tsPath);
   }
 
-  async updateTechSpec(
-    projectName: string,
-    techSpecName: string,
-    updates: Partial<Pick<TechSpec, 'description' | 'featureId' | 'details'>>
-  ): Promise<TechSpec> {
+  async updateTechSpec(projectName: string, techSpecName: string, updates: Partial<Pick<TechSpec, 'description' | 'featureId' | 'details'>>): Promise<TechSpec> {
     const spec = await this.getTechSpec(projectName, techSpecName);
     if (updates.description !== undefined) spec.description = updates.description;
     if (updates.featureId !== undefined) spec.featureId = updates.featureId;
     if (updates.details !== undefined) spec.details = updates.details;
     spec.updatedAt = now();
     await this.writeJson(this.techSpecPath(projectName, techSpecName), spec);
+    await this.logActivity(projectName, 'techspec', spec.id, spec.name, 'updated', `Updated techspec "${techSpecName}"`);
     return spec;
   }
 
   async deleteTechSpec(projectName: string, techSpecName: string): Promise<void> {
     const tsPath = this.techSpecPath(projectName, techSpecName);
     if (!existsSync(tsPath)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `TechSpec "${techSpecName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `TechSpec "${techSpecName}" not found in project "${projectName}"`);
     }
+    const spec = await this.readJson<TechSpec>(tsPath);
     await rm(tsPath, { force: true });
+    await this.cleanTagAssignments(projectName, 'techspec', spec.id);
+    await this.logActivity(projectName, 'techspec', spec.id, spec.name, 'deleted', `Deleted techspec "${techSpecName}"`);
   }
 
   // -- Research ------------------------------------------------------------
 
-  async addResearch(
-    projectName: string,
-    sessionName: string,
-    query: string,
-    findings: string,
-    conclusions: string,
-    sources: string[]
-  ): Promise<ResearchSession> {
+  async addResearch(projectName: string, sessionName: string, query: string, findings: string, conclusions: string, sources: string[]): Promise<ResearchSession> {
     await this.getProject(projectName);
     const filename = timestampedFilename('research', sessionName);
     const rPath = join(this.researchDir(projectName), filename);
-    const session: ResearchSession = {
-      id: generateId(),
-      sessionName,
-      query,
-      findings,
-      conclusions,
-      sources,
-      createdAt: now(),
-    };
+    const session: ResearchSession = { id: generateId(), sessionName, query, findings, conclusions, sources, createdAt: now() };
     await this.writeJson(rPath, session);
+    await this.logActivity(projectName, 'research', session.id, session.sessionName, 'created', `Created research session "${sessionName}"`);
     return session;
   }
 
@@ -541,92 +755,51 @@ class ProjectStore {
     await this.getProject(projectName);
     const files = await this.listJsonFiles(this.researchDir(projectName));
     const sessions: ResearchSession[] = [];
-    for (const f of files) {
-      try {
-        sessions.push(await this.readJson<ResearchSession>(f));
-      } catch {
-        // skip
-      }
-    }
+    for (const f of files) { try { sessions.push(await this.readJson<ResearchSession>(f)); } catch { /* skip */ } }
     return sessions;
   }
 
   async getResearch(projectName: string, sessionName: string): Promise<ResearchSession> {
-    const result = await this.findJsonFile<ResearchSession>(
-      this.researchDir(projectName),
-      (s) => sanitizeName(s.sessionName) === sanitizeName(sessionName)
-    );
+    const result = await this.findJsonFile<ResearchSession>(this.researchDir(projectName), (s) => sanitizeName(s.sessionName) === sanitizeName(sessionName));
     if (!result) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Research session "${sessionName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Research session "${sessionName}" not found in project "${projectName}"`);
     }
     return result.data;
   }
 
-  async updateResearch(
-    projectName: string,
-    sessionName: string,
-    updates: Partial<Pick<ResearchSession, 'findings' | 'conclusions' | 'sources'>>
-  ): Promise<ResearchSession> {
-    const result = await this.findJsonFile<ResearchSession>(
-      this.researchDir(projectName),
-      (s) => sanitizeName(s.sessionName) === sanitizeName(sessionName)
-    );
+  async updateResearch(projectName: string, sessionName: string, updates: Partial<Pick<ResearchSession, 'findings' | 'conclusions' | 'sources'>>): Promise<ResearchSession> {
+    const result = await this.findJsonFile<ResearchSession>(this.researchDir(projectName), (s) => sanitizeName(s.sessionName) === sanitizeName(sessionName));
     if (!result) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Research session "${sessionName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Research session "${sessionName}" not found in project "${projectName}"`);
     }
     const session = result.data;
     if (updates.findings !== undefined) session.findings = updates.findings;
     if (updates.conclusions !== undefined) session.conclusions = updates.conclusions;
     if (updates.sources !== undefined) session.sources = updates.sources;
     await this.writeJson(result.filePath, session);
+    await this.logActivity(projectName, 'research', session.id, session.sessionName, 'updated', `Updated research session "${sessionName}"`);
     return session;
   }
 
   async deleteResearch(projectName: string, sessionName: string): Promise<void> {
-    const result = await this.findJsonFile<ResearchSession>(
-      this.researchDir(projectName),
-      (s) => sanitizeName(s.sessionName) === sanitizeName(sessionName)
-    );
+    const result = await this.findJsonFile<ResearchSession>(this.researchDir(projectName), (s) => sanitizeName(s.sessionName) === sanitizeName(sessionName));
     if (!result) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Research session "${sessionName}" not found in project "${projectName}"`
-      );
+      throw new McpError(ErrorCode.InvalidParams, `Research session "${sessionName}" not found in project "${projectName}"`);
     }
     await rm(result.filePath, { force: true });
+    await this.cleanTagAssignments(projectName, 'research', result.data.id);
+    await this.logActivity(projectName, 'research', result.data.id, result.data.sessionName, 'deleted', `Deleted research session "${sessionName}"`);
   }
 
   // -- Plans ---------------------------------------------------------------
 
-  async createPlan(
-    projectName: string,
-    name: string,
-    description: string,
-    featureIds: string[],
-    techSpecIds: string[],
-    steps: string[]
-  ): Promise<Plan> {
+  async createPlan(projectName: string, name: string, description: string, featureIds: string[], techSpecIds: string[], steps: string[]): Promise<Plan> {
     await this.getProject(projectName);
     const filename = timestampedFilename('plan', name);
     const pPath = join(this.plansDir(projectName), filename);
-    const plan: Plan = {
-      id: generateId(),
-      name,
-      description,
-      featureIds,
-      techSpecIds,
-      status: 'draft',
-      steps,
-      createdAt: now(),
-      updatedAt: now(),
-    };
+    const plan: Plan = { id: generateId(), name, description, featureIds, techSpecIds, status: 'draft', steps, createdAt: now(), updatedAt: now() };
     await this.writeJson(pPath, plan);
+    await this.logActivity(projectName, 'plan', plan.id, plan.name, 'created', `Created plan "${name}"`);
     return plan;
   }
 
@@ -634,13 +807,7 @@ class ProjectStore {
     await this.getProject(projectName);
     const files = await this.listJsonFiles(this.plansDir(projectName));
     const plans: Plan[] = [];
-    for (const f of files) {
-      try {
-        plans.push(await this.readJson<Plan>(f));
-      } catch {
-        // skip
-      }
-    }
+    for (const f of files) { try { plans.push(await this.readJson<Plan>(f)); } catch { /* skip */ } }
     return plans;
   }
 
@@ -649,24 +816,13 @@ class ProjectStore {
     return plans.find((p) => sanitizeName(p.name) === sanitizeName(planName)) ?? null;
   }
 
-  async updatePlanStatus(
-    projectName: string,
-    planName: string,
-    status: Plan['status'],
-    steps?: string[]
-  ): Promise<Plan> {
+  async updatePlanStatus(projectName: string, planName: string, status: Plan['status'], steps?: string[]): Promise<Plan> {
     const plan = await this.getPlan(projectName, planName);
-    if (!plan) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Plan "${planName}" not found in project "${projectName}"`
-      );
-    }
+    if (!plan) throw new McpError(ErrorCode.InvalidParams, `Plan "${planName}" not found in project "${projectName}"`);
+    const oldStatus = plan.status;
     plan.status = status;
     if (steps !== undefined) plan.steps = steps;
     plan.updatedAt = now();
-
-    // Find the actual file path and rewrite
     const plansDir = this.plansDir(projectName);
     const files = await this.listJsonFiles(plansDir);
     for (const f of files) {
@@ -676,10 +832,9 @@ class ProjectStore {
           await this.writeJson(f, plan);
           break;
         }
-      } catch {
-        // skip
-      }
+      } catch { /* skip */ }
     }
+    await this.logActivity(projectName, 'plan', plan.id, plan.name, 'status_changed', `Status changed from "${oldStatus}" to "${status}"`);
     return plan;
   }
 
@@ -691,44 +846,24 @@ class ProjectStore {
         const p = await this.readJson<Plan>(f);
         if (sanitizeName(p.name) === sanitizeName(planName)) {
           await rm(f, { force: true });
+          await this.cleanTagAssignments(projectName, 'plan', p.id);
+          await this.logActivity(projectName, 'plan', p.id, p.name, 'deleted', `Deleted plan "${planName}"`);
           return;
         }
-      } catch {
-        // skip
-      }
+      } catch { /* skip */ }
     }
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `Plan "${planName}" not found in project "${projectName}"`
-    );
+    throw new McpError(ErrorCode.InvalidParams, `Plan "${planName}" not found in project "${projectName}"`);
   }
 
   // -- Tasks ---------------------------------------------------------------
 
-  async createTask(
-    projectName: string,
-    name: string,
-    description: string,
-    priority: Task['priority'] = 'medium',
-    dependencies: string[] = [],
-    planId: string = ''
-  ): Promise<Task> {
+  async createTask(projectName: string, name: string, description: string, priority: Task['priority'] = 'medium', dependencies: string[] = [], planId: string = ''): Promise<Task> {
     await this.getProject(projectName);
     const filename = timestampedFilename('task', name);
     const tPath = join(this.tasksDir(projectName), filename);
-    const task: Task = {
-      id: generateId(),
-      name,
-      description,
-      status: 'pending',
-      priority,
-      assignedTo: '',
-      dependencies,
-      planId,
-      createdAt: now(),
-      updatedAt: now(),
-    };
+    const task: Task = { id: generateId(), name, description, status: 'pending', priority, assignedTo: '', dependencies, planId, createdAt: now(), updatedAt: now() };
     await this.writeJson(tPath, task);
+    await this.logActivity(projectName, 'task', task.id, task.name, 'created', `Created task "${name}"`);
     return task;
   }
 
@@ -736,13 +871,7 @@ class ProjectStore {
     await this.getProject(projectName);
     const files = await this.listJsonFiles(this.tasksDir(projectName));
     const tasks: Task[] = [];
-    for (const f of files) {
-      try {
-        tasks.push(await this.readJson<Task>(f));
-      } catch {
-        // skip
-      }
-    }
+    for (const f of files) { try { tasks.push(await this.readJson<Task>(f)); } catch { /* skip */ } }
     return tasks;
   }
 
@@ -751,11 +880,7 @@ class ProjectStore {
     return tasks.find((t) => sanitizeName(t.name) === sanitizeName(taskName)) ?? null;
   }
 
-  async updateTask(
-    projectName: string,
-    taskName: string,
-    updates: Partial<Pick<Task, 'description' | 'status' | 'priority' | 'assignedTo' | 'dependencies'>>
-  ): Promise<Task> {
+  async updateTask(projectName: string, taskName: string, updates: Partial<Pick<Task, 'description' | 'status' | 'priority' | 'assignedTo' | 'dependencies'>>): Promise<Task> {
     const tasksDir = this.tasksDir(projectName);
     const files = await this.listJsonFiles(tasksDir);
     for (const f of files) {
@@ -764,33 +889,32 @@ class ProjectStore {
         if (sanitizeName(t.name) === sanitizeName(taskName)) {
           const task: Task = { ...t };
           if (updates.description !== undefined) task.description = updates.description;
-          if (updates.status !== undefined) task.status = updates.status;
           if (updates.priority !== undefined) task.priority = updates.priority;
-          if (updates.assignedTo !== undefined) task.assignedTo = updates.assignedTo;
+          if (updates.assignedTo !== undefined) {
+            const oldAssignee = task.assignedTo;
+            task.assignedTo = updates.assignedTo;
+            await this.logActivity(projectName, 'task', task.id, task.name, 'reassigned', `Assigned from "${oldAssignee}" to "${updates.assignedTo}"`);
+          }
+          if (updates.status !== undefined) {
+            const oldStatus = task.status;
+            task.status = updates.status;
+            await this.logActivity(projectName, 'task', task.id, task.name, 'status_changed', `Status changed from "${oldStatus}" to "${updates.status}"`);
+          }
           if (updates.dependencies !== undefined) task.dependencies = updates.dependencies;
           task.updatedAt = now();
           await this.writeJson(f, task);
           return task;
         }
-      } catch {
-        // skip
-      }
+      } catch { /* skip */ }
     }
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `Task "${taskName}" not found in project "${projectName}"`
-    );
+    throw new McpError(ErrorCode.InvalidParams, `Task "${taskName}" not found in project "${projectName}"`);
   }
 
   async assignTask(projectName: string, taskName: string, assignee: string): Promise<Task> {
     return this.updateTask(projectName, taskName, { assignedTo: assignee });
   }
 
-  async updateTaskStatus(
-    projectName: string,
-    taskName: string,
-    status: Task['status']
-  ): Promise<Task> {
+  async updateTaskStatus(projectName: string, taskName: string, status: Task['status']): Promise<Task> {
     return this.updateTask(projectName, taskName, { status });
   }
 
@@ -802,32 +926,374 @@ class ProjectStore {
         const t = await this.readJson<Task>(f);
         if (sanitizeName(t.name) === sanitizeName(taskName)) {
           await rm(f, { force: true });
+          await this.cleanTagAssignments(projectName, 'task', t.id);
+          await this.logActivity(projectName, 'task', t.id, t.name, 'deleted', `Deleted task "${taskName}"`);
           return;
         }
-      } catch {
-        // skip
-      }
+      } catch { /* skip */ }
     }
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `Task "${taskName}" not found in project "${projectName}"`
-    );
+    throw new McpError(ErrorCode.InvalidParams, `Task "${taskName}" not found in project "${projectName}"`);
+  }
+
+  // -- Decisions -----------------------------------------------------------
+
+  async addDecision(
+    projectName: string,
+    title: string,
+    context: string,
+    decision: string,
+    rationale: string,
+    consequences: string,
+    options?: string[],
+    tags?: string[],
+    relatedFeatures?: string[]
+  ): Promise<Decision> {
+    await this.getProject(projectName);
+    const filename = timestampedFilename('decision', title);
+    const dPath = join(this.decisionsDir(projectName), filename);
+    const rec: Decision = {
+      id: generateId(),
+      title,
+      context,
+      options: options ?? [],
+      decision,
+      rationale,
+      consequences,
+      status: 'proposed',
+      supersededBy: '',
+      tags: tags ?? [],
+      relatedFeatures: relatedFeatures ?? [],
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    await this.writeJson(dPath, rec);
+    await this.logActivity(projectName, 'decision', rec.id, rec.title, 'created', `Created decision record "${title}"`);
+    return rec;
+  }
+
+  async listDecisions(projectName: string): Promise<Decision[]> {
+    await this.getProject(projectName);
+    const files = await this.listJsonFiles(this.decisionsDir(projectName));
+    const decisions: Decision[] = [];
+    for (const f of files) { try { decisions.push(await this.readJson<Decision>(f)); } catch { /* skip */ } }
+    return decisions;
+  }
+
+  async getDecision(projectName: string, title: string): Promise<Decision> {
+    const decisions = await this.listDecisions(projectName);
+    const d = decisions.find((d) => sanitizeName(d.title) === sanitizeName(title));
+    if (!d) throw new McpError(ErrorCode.InvalidParams, `Decision "${title}" not found in project "${projectName}"`);
+    return d;
+  }
+
+  async updateDecision(
+    projectName: string,
+    title: string,
+    updates: Partial<Pick<Decision, 'context' | 'options' | 'decision' | 'rationale' | 'consequences' | 'status' | 'supersededBy' | 'tags' | 'relatedFeatures'>>
+  ): Promise<Decision> {
+    const decisions = await this.listDecisions(projectName);
+    const files = await this.listJsonFiles(this.decisionsDir(projectName));
+    for (const f of files) {
+      try {
+        const d = await this.readJson<Decision>(f);
+        if (sanitizeName(d.title) === sanitizeName(title)) {
+          if (updates.context !== undefined) d.context = updates.context;
+          if (updates.options !== undefined) d.options = updates.options;
+          if (updates.decision !== undefined) d.decision = updates.decision;
+          if (updates.rationale !== undefined) d.rationale = updates.rationale;
+          if (updates.consequences !== undefined) d.consequences = updates.consequences;
+          if (updates.tags !== undefined) d.tags = updates.tags;
+          if (updates.relatedFeatures !== undefined) d.relatedFeatures = updates.relatedFeatures;
+          if (updates.status !== undefined) {
+            const oldStatus = d.status;
+            d.status = updates.status;
+            await this.logActivity(projectName, 'decision', d.id, d.title, 'status_changed', `Status changed from "${oldStatus}" to "${updates.status}"`);
+          }
+          if (updates.supersededBy !== undefined) d.supersededBy = updates.supersededBy;
+          d.updatedAt = now();
+          await this.writeJson(f, d);
+          return d;
+        }
+      } catch { /* skip */ }
+    }
+    throw new McpError(ErrorCode.InvalidParams, `Decision "${title}" not found in project "${projectName}"`);
+  }
+
+  async deleteDecision(projectName: string, title: string): Promise<void> {
+    const decisionsDir = this.decisionsDir(projectName);
+    const files = await this.listJsonFiles(decisionsDir);
+    for (const f of files) {
+      try {
+        const d = await this.readJson<Decision>(f);
+        if (sanitizeName(d.title) === sanitizeName(title)) {
+          await rm(f, { force: true });
+          await this.cleanTagAssignments(projectName, 'decision', d.id);
+          await this.logActivity(projectName, 'decision', d.id, d.title, 'deleted', `Deleted decision "${title}"`);
+          return;
+        }
+      } catch { /* skip */ }
+    }
+    throw new McpError(ErrorCode.InvalidParams, `Decision "${title}" not found in project "${projectName}"`);
+  }
+
+  // -- Risks ---------------------------------------------------------------
+
+  async addRisk(
+    projectName: string,
+    title: string,
+    description: string,
+    category: Risk['category'],
+    likelihood: Risk['likelihood'],
+    impact: Risk['impact'],
+    mitigation?: string,
+    contingency?: string,
+    owner?: string,
+    tags?: string[],
+    relatedFeatures?: string[]
+  ): Promise<Risk> {
+    await this.getProject(projectName);
+    const severity = likelihood * impact;
+    const filename = timestampedFilename('risk', title);
+    const rPath = join(this.risksDir(projectName), filename);
+    const risk: Risk = {
+      id: generateId(),
+      title,
+      description,
+      category,
+      likelihood,
+      impact,
+      severity,
+      status: 'identified',
+      mitigation: mitigation ?? '',
+      contingency: contingency ?? '',
+      owner: owner ?? '',
+      tags: tags ?? [],
+      relatedFeatures: relatedFeatures ?? [],
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    await this.writeJson(rPath, risk);
+    await this.logActivity(projectName, 'risk', risk.id, risk.title, 'created', `Created risk "${title}" (severity: ${severity})`);
+    return risk;
+  }
+
+  async listRisks(projectName: string): Promise<Risk[]> {
+    await this.getProject(projectName);
+    const files = await this.listJsonFiles(this.risksDir(projectName));
+    const risks: Risk[] = [];
+    for (const f of files) { try { risks.push(await this.readJson<Risk>(f)); } catch { /* skip */ } }
+    return risks;
+  }
+
+  async getRisk(projectName: string, title: string): Promise<Risk> {
+    const risks = await this.listRisks(projectName);
+    const r = risks.find((r) => sanitizeName(r.title) === sanitizeName(title));
+    if (!r) throw new McpError(ErrorCode.InvalidParams, `Risk "${title}" not found in project "${projectName}"`);
+    return r;
+  }
+
+  async updateRisk(
+    projectName: string,
+    title: string,
+    updates: Partial<Pick<Risk, 'description' | 'category' | 'likelihood' | 'impact' | 'status' | 'mitigation' | 'contingency' | 'owner' | 'tags' | 'relatedFeatures'>>
+  ): Promise<Risk> {
+    const risksDir = this.risksDir(projectName);
+    const files = await this.listJsonFiles(risksDir);
+    for (const f of files) {
+      try {
+        const r = await this.readJson<Risk>(f);
+        if (sanitizeName(r.title) === sanitizeName(title)) {
+          if (updates.description !== undefined) r.description = updates.description;
+          if (updates.category !== undefined) r.category = updates.category;
+          if (updates.likelihood !== undefined) r.likelihood = updates.likelihood;
+          if (updates.impact !== undefined) r.impact = updates.impact;
+          if (updates.mitigation !== undefined) r.mitigation = updates.mitigation;
+          if (updates.contingency !== undefined) r.contingency = updates.contingency;
+          if (updates.owner !== undefined) r.owner = updates.owner;
+          if (updates.tags !== undefined) r.tags = updates.tags;
+          if (updates.relatedFeatures !== undefined) r.relatedFeatures = updates.relatedFeatures;
+          if (updates.likelihood !== undefined || updates.impact !== undefined) {
+            r.severity = r.likelihood * r.impact;
+          }
+          if (updates.status !== undefined) {
+            const oldStatus = r.status;
+            r.status = updates.status;
+            await this.logActivity(projectName, 'risk', r.id, r.title, 'status_changed', `Status changed from "${oldStatus}" to "${updates.status}"`);
+          }
+          r.updatedAt = now();
+          await this.writeJson(f, r);
+          return r;
+        }
+      } catch { /* skip */ }
+    }
+    throw new McpError(ErrorCode.InvalidParams, `Risk "${title}" not found in project "${projectName}"`);
+  }
+
+  async deleteRisk(projectName: string, title: string): Promise<void> {
+    const risksDir = this.risksDir(projectName);
+    const files = await this.listJsonFiles(risksDir);
+    for (const f of files) {
+      try {
+        const r = await this.readJson<Risk>(f);
+        if (sanitizeName(r.title) === sanitizeName(title)) {
+          await rm(f, { force: true });
+          await this.cleanTagAssignments(projectName, 'risk', r.id);
+          await this.logActivity(projectName, 'risk', r.id, r.title, 'deleted', `Deleted risk "${title}"`);
+          return;
+        }
+      } catch { /* skip */ }
+    }
+    throw new McpError(ErrorCode.InvalidParams, `Risk "${title}" not found in project "${projectName}"`);
+  }
+
+  // -- Export / Import -----------------------------------------------------
+
+  async exportProject(projectName: string): Promise<ProjectExport> {
+    const project = await this.getProject(projectName);
+    const [
+      features, techSpecs, research, plans, tasks,
+      decisions, risks, tags, tagAssignments, activityLog,
+    ] = await Promise.all([
+      this.listFeatures(projectName),
+      this.listTechSpecs(projectName),
+      this.listResearch(projectName),
+      this.listPlans(projectName),
+      this.listTasks(projectName),
+      this.listDecisions(projectName),
+      this.listRisks(projectName),
+      this.readTags(projectName).catch(() => [] as Tag[]),
+      this.readTagAssignments(projectName).catch(() => [] as TagAssignment[]),
+      this.listActivity(projectName),
+    ]);
+
+    return {
+      exportVersion: '1.0',
+      exportedAt: now(),
+      sourceHost: 'project-planer-mcp',
+      project,
+      features,
+      techSpecs,
+      research,
+      plans,
+      tasks,
+      decisions,
+      risks,
+      tags,
+      tagAssignments,
+      activityLog,
+    };
+  }
+
+  async importProject(data: ProjectExport, overwriteExisting: boolean = false, importAs?: string): Promise<ProjectMeta> {
+    const projectName = importAs ?? data.project.name;
+    const projDir = this.projectDir(projectName);
+    const metaPath = this.projectMetaPath(projectName);
+
+    if (existsSync(metaPath) && !overwriteExisting) {
+      throw new McpError(ErrorCode.InvalidParams, `Project "${projectName}" already exists. Use overwriteExisting=true to replace.`);
+    }
+
+    // If overwriting, delete first
+    if (existsSync(projDir)) {
+      await rm(projDir, { recursive: true, force: true });
+    }
+
+    // Create the project structure
+    await mkdir(join(projDir, 'Features'), { recursive: true });
+    await mkdir(join(projDir, 'TechSpecs'), { recursive: true });
+    await mkdir(join(projDir, 'Research'), { recursive: true });
+    await mkdir(join(projDir, 'Plans'), { recursive: true });
+    await mkdir(join(projDir, 'Tasks'), { recursive: true });
+    await mkdir(join(projDir, 'Decisions'), { recursive: true });
+    await mkdir(join(projDir, 'Risks'), { recursive: true });
+    await mkdir(join(projDir, 'Tags'), { recursive: true });
+    await mkdir(join(projDir, 'Activity'), { recursive: true });
+
+    // Generate new IDs for all entities to avoid cross-instance collisions,
+    // and build ID remapping tables.
+    const idMap = new Map<string, string>();
+
+    const newProjectId = generateId();
+    idMap.set(data.project.id, newProjectId);
+
+    // Remap project
+    const project: ProjectMeta = {
+      ...data.project,
+      id: newProjectId,
+      name: projectName,
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    await this.writeJson(metaPath, project);
+
+    // Helper to write entities with ID remapping
+    const writeEntities = async <T extends { id: string }>(
+      dir: string,
+      items: T[],
+      nameKey: string,
+      prefix: string
+    ) => {
+      for (const item of items) {
+        const newId = generateId();
+        idMap.set(item.id, newId);
+        const entity = { ...item, id: newId };
+        const safeName = sanitizeName(String((entity as any)[nameKey] ?? 'unnamed'));
+        const filename = prefix === 'feature'
+          ? `${safeName}.json`
+          : timestampedFilename(prefix, safeName);
+        await this.writeJson(join(dir, filename), entity);
+      }
+    };
+
+    await writeEntities(this.featuresDir(projectName), data.features, 'name', 'feature');
+    await writeEntities(this.techSpecsDir(projectName), data.techSpecs, 'name', 'techspec');
+    await writeEntities(this.researchDir(projectName), data.research, 'sessionName', 'research');
+    await writeEntities(this.plansDir(projectName), data.plans, 'name', 'plan');
+    await writeEntities(this.tasksDir(projectName), data.tasks, 'name', 'task');
+    await writeEntities(this.decisionsDir(projectName), data.decisions, 'title', 'decision');
+    await writeEntities(this.risksDir(projectName), data.risks, 'title', 'risk');
+
+    // Tags don't need per-file storage, use index
+    const importedTags = data.tags.map((t) => ({ ...t, id: generateId() }));
+    const tagIdMap = new Map<string, string>();
+    for (let i = 0; i < data.tags.length; i++) {
+      tagIdMap.set(data.tags[i].id, importedTags[i].id);
+    }
+    await this.writeJson(this.tagsIndexPath(projectName), importedTags);
+
+    // Remap tag assignments to use new tag IDs
+    const remappedAssignments = data.tagAssignments
+      .filter((a) => tagIdMap.has(a.tagId))
+      .map((a) => ({
+        ...a,
+        tagId: tagIdMap.get(a.tagId)!,
+      }));
+    await this.writeJson(this.tagAssignmentsPath(projectName), remappedAssignments);
+
+    // Recreate activity log with new entity IDs
+    for (const entry of data.activityLog) {
+      const newEntityId = idMap.get(entry.entityId) ?? entry.entityId;
+      const filename = timestampedFilename('activity', entry.entityName);
+      const aPath = join(this.activityDir(projectName), filename);
+      await this.writeJson(aPath, {
+        ...entry,
+        id: generateId(),
+        entityId: newEntityId,
+        timestamp: entry.timestamp,
+      });
+    }
+
+    await this.logActivity(projectName, 'project', project.id, project.name, 'created', `Imported project "${projectName}" from export`);
+    return project;
   }
 
   // -- Advanced: Search, Summary, Dependency Graph -------------------------
 
-  /**
-   * Full-text search across all entities in a project.
-   * Searches in: feature names/descriptions, tech spec names/details,
-   * research queries/findings/conclusions, plan names/descriptions/steps,
-   * task names/descriptions.
-   */
   async searchProject(projectName: string, query: string): Promise<SearchResult[]> {
     await this.getProject(projectName);
     const results: SearchResult[] = [];
     const lowerQuery = query.toLowerCase();
 
-    // Helper: search a directory of JSON files
     const searchDir = async (dir: string, type: string, nameKey: string, searchFields: string[]) => {
       const files = await this.listJsonFiles(dir);
       for (const f of files) {
@@ -835,31 +1301,19 @@ class ProjectStore {
           const raw = await readFile(f, 'utf-8');
           const data = JSON.parse(raw);
           const name = data[nameKey] ?? 'unknown';
-          // Check if any of the search fields contain the query
           const matchField = searchFields.find((field) => {
             const val = data[field];
             return typeof val === 'string' && val.toLowerCase().includes(lowerQuery);
           });
           if (matchField) {
-            // Find the exact match context
             const val = data[matchField] as string;
             const idx = val.toLowerCase().indexOf(lowerQuery);
             const start = Math.max(0, idx - 60);
             const end = Math.min(val.length, idx + lowerQuery.length + 60);
-            const context = (start > 0 ? '...' : '') +
-              val.slice(start, end) +
-              (end < val.length ? '...' : '');
-            results.push({
-              type,
-              id: data.id ?? '',
-              name: String(name),
-              filePath: relative(this.projectDir(projectName), f),
-              matchContext: `[${matchField}] ${context}`,
-            });
+            const context = (start > 0 ? '...' : '') + val.slice(start, end) + (end < val.length ? '...' : '');
+            results.push({ type, id: data.id ?? '', name: String(name), filePath: relative(this.projectDir(projectName), f), matchContext: `[${matchField}] ${context}` });
           }
-        } catch {
-          // skip corrupt files
-        }
+        } catch { /* skip */ }
       }
     };
 
@@ -867,11 +1321,13 @@ class ProjectStore {
       searchDir(this.featuresDir(projectName), 'feature', 'name', ['name', 'description']),
       searchDir(this.techSpecsDir(projectName), 'techspec', 'name', ['name', 'description', 'details']),
       searchDir(this.researchDir(projectName), 'research', 'sessionName', ['sessionName', 'query', 'findings', 'conclusions']),
-      searchDir(this.plansDir(projectName), 'plan', 'name', ['name', 'description', ...['steps'].flatMap((_) => [])]), // steps is an array, need special handling
+      searchDir(this.plansDir(projectName), 'plan', 'name', ['name', 'description']),
       searchDir(this.tasksDir(projectName), 'task', 'name', ['name', 'description']),
+      searchDir(this.decisionsDir(projectName), 'decision', 'title', ['title', 'context', 'decision', 'rationale', 'consequences']),
+      searchDir(this.risksDir(projectName), 'risk', 'title', ['title', 'description', 'mitigation', 'contingency']),
     ]);
 
-    // Special handling for plan steps (array of strings)
+    // Special: search plan steps (array of strings)
     {
       const files = await this.listJsonFiles(this.plansDir(projectName));
       for (const f of files) {
@@ -880,37 +1336,22 @@ class ProjectStore {
           const data = JSON.parse(raw);
           const steps = data.steps as string[] | undefined;
           if (steps && Array.isArray(steps)) {
-            const matchingStep = steps.find((s: string) =>
-              typeof s === 'string' && s.toLowerCase().includes(lowerQuery)
-            );
+            const matchingStep = steps.find((s: string) => typeof s === 'string' && s.toLowerCase().includes(lowerQuery));
             if (matchingStep) {
               const idx = matchingStep.toLowerCase().indexOf(lowerQuery);
               const start = Math.max(0, idx - 60);
               const end = Math.min(matchingStep.length, idx + lowerQuery.length + 60);
-              const context = (start > 0 ? '...' : '') +
-                matchingStep.slice(start, end) +
-                (end < matchingStep.length ? '...' : '');
-              results.push({
-                type: 'plan',
-                id: data.id ?? '',
-                name: data.name ?? 'unknown',
-                filePath: relative(this.projectDir(projectName), f),
-                matchContext: `[steps] ${context}`,
-              });
+              const context = (start > 0 ? '...' : '') + matchingStep.slice(start, end) + (end < matchingStep.length ? '...' : '');
+              results.push({ type: 'plan', id: data.id ?? '', name: data.name ?? 'unknown', filePath: relative(this.projectDir(projectName), f), matchContext: `[steps] ${context}` });
             }
           }
-        } catch {
-          // skip
-        }
+        } catch { /* skip */ }
       }
     }
 
     return results;
   }
 
-  /**
-   * Generate a summary of a project with counts and breakdowns.
-   */
   async projectSummary(projectName: string): Promise<ProjectSummary> {
     const project = await this.getProject(projectName);
     const features = await this.listFeatures(projectName);
@@ -918,8 +1359,10 @@ class ProjectStore {
     const research = await this.listResearch(projectName);
     const plans = await this.listPlans(projectName);
     const tasks = await this.listTasks(projectName);
+    const decisions = await this.listDecisions(projectName);
+    const risks = await this.listRisks(projectName);
+    const tags = await this.readTags(projectName).catch(() => [] as Tag[]);
 
-    // Feature breakdowns
     const featuresByStatus: Record<string, number> = {};
     const featuresByPriority: Record<string, number> = {};
     for (const f of features) {
@@ -927,18 +1370,29 @@ class ProjectStore {
       featuresByPriority[f.priority] = (featuresByPriority[f.priority] ?? 0) + 1;
     }
 
-    // Plan breakdowns
     const plansByStatus: Record<string, number> = {};
     for (const p of plans) {
       plansByStatus[p.status] = (plansByStatus[p.status] ?? 0) + 1;
     }
 
-    // Task breakdowns
     const tasksByStatus: Record<string, number> = {};
     const tasksByPriority: Record<string, number> = {};
     for (const t of tasks) {
       tasksByStatus[t.status] = (tasksByStatus[t.status] ?? 0) + 1;
       tasksByPriority[t.priority] = (tasksByPriority[t.priority] ?? 0) + 1;
+    }
+
+    const decisionsByStatus: Record<string, number> = {};
+    for (const d of decisions) {
+      decisionsByStatus[d.status] = (decisionsByStatus[d.status] ?? 0) + 1;
+    }
+
+    const risksBySeverity: Record<string, number> = {};
+    const risksByCategory: Record<string, number> = {};
+    for (const r of risks) {
+      const sevKey = r.severity <= 4 ? 'low (1-4)' : r.severity <= 9 ? 'medium (5-9)' : r.severity <= 15 ? 'high (10-15)' : 'critical (16-25)';
+      risksBySeverity[sevKey] = (risksBySeverity[sevKey] ?? 0) + 1;
+      risksByCategory[r.category] = (risksByCategory[r.category] ?? 0) + 1;
     }
 
     return {
@@ -953,68 +1407,45 @@ class ProjectStore {
       taskCount: tasks.length,
       tasksByStatus,
       tasksByPriority,
+      decisionCount: decisions.length,
+      decisionsByStatus,
+      riskCount: risks.length,
+      risksBySeverity,
+      risksByCategory,
+      tagCount: tags.length,
     };
   }
 
-  /**
-   * Build a dependency graph for a feature or task.
-   * Shows what it depends on and what depends on it, recursively (default depth 1, max 3).
-   */
-  async dependencyGraph(
-    projectName: string,
-    entityType: 'feature' | 'task',
-    entityName: string,
-    maxDepth: number = 1
-  ): Promise<{ root: DependencyNode; nodes: DependencyNode[] }> {
+  async dependencyGraph(projectName: string, entityType: 'feature' | 'task', entityName: string, maxDepth: number = 1): Promise<{ root: DependencyNode; nodes: DependencyNode[] }> {
     const clampedDepth = Math.min(Math.max(1, maxDepth), 3);
-
-    // Load all features and tasks
     const allFeatures = await this.listFeatures(projectName);
     const allTasks = await this.listTasks(projectName);
 
-    // Build lookup maps
     const featureMap = new Map(allFeatures.map((f) => [f.id, f]));
     const featureByNameMap = new Map(allFeatures.map((f) => [sanitizeName(f.name), f]));
     const taskMap = new Map(allTasks.map((t) => [t.id, t]));
     const taskByNameMap = new Map(allTasks.map((t) => [sanitizeName(t.name), t]));
 
-    // Find the root entity
     let rootEntity: { id: string; name: string; type: 'feature' | 'task'; status: string; dependencies: string[] };
     if (entityType === 'feature') {
       const feat = featureByNameMap.get(sanitizeName(entityName));
-      if (!feat) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          `Feature "${entityName}" not found in project "${projectName}"`
-        );
-      }
+      if (!feat) throw new McpError(ErrorCode.InvalidParams, `Feature "${entityName}" not found in project "${projectName}"`);
       rootEntity = { id: feat.id, name: feat.name, type: 'feature', status: feat.status, dependencies: feat.dependencies };
     } else {
       const task = taskByNameMap.get(sanitizeName(entityName));
-      if (!task) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          `Task "${entityName}" not found in project "${projectName}"`
-        );
-      }
+      if (!task) throw new McpError(ErrorCode.InvalidParams, `Task "${entityName}" not found in project "${projectName}"`);
       rootEntity = { id: task.id, name: task.name, type: 'task', status: task.status, dependencies: task.dependencies };
     }
 
-    // Build reverse dependency map (who depends on whom)
     const reverseDepMap = new Map<string, string[]>();
     const addReverseDep = (dependsOn: string, dependent: string) => {
       const existing = reverseDepMap.get(dependsOn) ?? [];
       existing.push(dependent);
       reverseDepMap.set(dependsOn, existing);
     };
-    for (const f of allFeatures) {
-      for (const depId of f.dependencies) addReverseDep(depId, f.id);
-    }
-    for (const t of allTasks) {
-      for (const depId of t.dependencies) addReverseDep(depId, t.id);
-    }
+    for (const f of allFeatures) { for (const depId of f.dependencies) addReverseDep(depId, f.id); }
+    for (const t of allTasks) { for (const depId of t.dependencies) addReverseDep(depId, t.id); }
 
-    // BFS to collect all nodes up to clampedDepth
     const visited = new Set<string>();
     const nodes: DependencyNode[] = [];
     const queue: Array<{ id: string; depth: number }> = [{ id: rootEntity.id, depth: 0 }];
@@ -1024,7 +1455,6 @@ class ProjectStore {
       if (visited.has(current.id)) continue;
       visited.add(current.id);
 
-      // Determine type
       const isFeature = featureMap.has(current.id);
       const entity = isFeature ? featureMap.get(current.id) : taskMap.get(current.id);
       if (!entity) continue;
@@ -1032,31 +1462,26 @@ class ProjectStore {
       const dependsOn = entity.dependencies;
       const dependedBy = reverseDepMap.get(current.id) ?? [];
 
-      nodes.push({
-        id: entity.id,
-        name: entity.name,
-        type: isFeature ? 'feature' : 'task',
-        status: entity.status,
-        dependsOn,
-        dependedBy,
-      });
+      nodes.push({ id: entity.id, name: entity.name, type: isFeature ? 'feature' : 'task', status: entity.status, dependsOn, dependedBy });
 
       if (current.depth < clampedDepth) {
-        for (const depId of dependsOn) {
-          if (!visited.has(depId)) {
-            queue.push({ id: depId, depth: current.depth + 1 });
-          }
-        }
-        for (const depId of dependedBy) {
-          if (!visited.has(depId)) {
-            queue.push({ id: depId, depth: current.depth + 1 });
-          }
-        }
+        for (const depId of dependsOn) { if (!visited.has(depId)) queue.push({ id: depId, depth: current.depth + 1 }); }
+        for (const depId of dependedBy) { if (!visited.has(depId)) queue.push({ id: depId, depth: current.depth + 1 }); }
       }
     }
 
     const root = nodes.find((n) => n.id === rootEntity.id)!;
     return { root, nodes };
+  }
+
+  // -- Internal helpers ----------------------------------------------------
+
+  private async findJsonFile<T>(dir: string, predicate: (item: T) => boolean): Promise<{ data: T; filePath: string } | null> {
+    const files = await this.listJsonFiles(dir);
+    for (const f of files) {
+      try { const data = await this.readJson<T>(f); if (predicate(data)) return { data, filePath: f }; } catch { /* skip */ }
+    }
+    return null;
   }
 }
 
@@ -1080,10 +1505,7 @@ function asRecord(args: unknown): Record<string, unknown> {
 function getString(args: Record<string, unknown>, key: string): string {
   const v = args[key];
   if (typeof v !== 'string' || v.length === 0) {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `"${key}" is required and must be a non-empty string`
-    );
+    throw new McpError(ErrorCode.InvalidParams, `"${key}" is required and must be a non-empty string`);
   }
   return v;
 }
@@ -1097,10 +1519,7 @@ function getStringArray(args: Record<string, unknown>, key: string): string[] {
   const v = args[key];
   if (v === undefined) return [];
   if (!Array.isArray(v) || !v.every((e) => typeof e === 'string')) {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `"${key}" must be an array of strings`
-    );
+    throw new McpError(ErrorCode.InvalidParams, `"${key}" must be an array of strings`);
   }
   return v as string[];
 }
@@ -1108,19 +1527,34 @@ function getStringArray(args: Record<string, unknown>, key: string): string[] {
 function getOptionalNumber(args: Record<string, unknown>, key: string): number | undefined {
   const v = args[key];
   if (v === undefined) return undefined;
-  if (typeof v !== 'number') {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `"${key}" must be a number`
-    );
+  if (typeof v !== 'number') throw new McpError(ErrorCode.InvalidParams, `"${key}" must be a number`);
+  return v;
+}
+
+function getBoolean(args: Record<string, unknown>, key: string): boolean | undefined {
+  const v = args[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== 'boolean') throw new McpError(ErrorCode.InvalidParams, `"${key}" must be a boolean`);
+  return v;
+}
+
+function getOptionalEnum<T extends string>(args: Record<string, unknown>, key: string, validValues: readonly T[]): T | undefined {
+  const v = args[key];
+  if (v === undefined) return undefined;
+  if (validValues.includes(v as T)) return v as T;
+  throw new McpError(ErrorCode.InvalidParams, `"${key}" must be one of: ${validValues.join(', ')}`);
+}
+
+function getNumber(args: Record<string, unknown>, key: string, min: number, max: number): number {
+  const v = args[key];
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > max) {
+    throw new McpError(ErrorCode.InvalidParams, `"${key}" must be an integer between ${min} and ${max}`);
   }
   return v;
 }
 
 function textResponse(data: unknown) {
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-  };
+  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,788 +1566,94 @@ class ProjectPlanerServer {
 
   constructor() {
     this.server = new Server(
-      {
-        name: 'project-planer-mcp',
-        version: '0.3.0',
-      },
-      {
-        capabilities: { tools: {} },
-      }
+      { name: 'project-planer-mcp', version: '0.4.0' },
+      { capabilities: { tools: {} } }
     );
 
     this.setupToolHandlers();
-
     this.server.onerror = (error) => console.error('[MCP Error]', error);
-
-    process.on('SIGINT', async () => {
-      await this.server.close();
-      process.exit(0);
-    });
+    process.on('SIGINT', async () => { await this.server.close(); process.exit(0); });
   }
 
   private setupToolHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         // ---- Project tools ----
-        {
-          name: 'create_project',
-          description:
-            'Create a new project with its directory scaffold (Features, TechSpecs, Research, Plans, Tasks). The project name becomes the directory name.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              name: {
-                type: 'string',
-                description: 'Name of the project (used as directory name)',
-              },
-              description: {
-                type: 'string',
-                description: 'What the project aims to solve or add',
-              },
-            },
-            required: ['name'],
-          },
-        },
-        {
-          name: 'list_projects',
-          description: 'List all projects with their metadata',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-          },
-        },
-        {
-          name: 'get_project',
-          description: 'Get detailed information about a project including its metadata',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'update_project',
-          description: 'Update a project\'s description or status',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              description: {
-                type: 'string',
-                description: 'New description',
-              },
-              status: {
-                type: 'string',
-                enum: ['active', 'archived'],
-                description: 'New project status',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'delete_project',
-          description: 'Permanently delete a project and all its files',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project to delete',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
+        { name: 'create_project', description: 'Create a new project with its directory scaffold (Features, TechSpecs, Research, Plans, Tasks, Decisions, Risks, Tags, Activity).', inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Name of the project' }, description: { type: 'string', description: 'What the project aims to solve' } }, required: ['name'] } },
+        { name: 'list_projects', description: 'List all projects with their metadata', inputSchema: { type: 'object', properties: {} } },
+        { name: 'get_project', description: 'Get detailed information about a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string', description: 'Name of the project' } }, required: ['projectName'] } },
+        { name: 'update_project', description: "Update a project's description or status", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, description: { type: 'string' }, status: { type: 'string', enum: ['active', 'archived'] } }, required: ['projectName'] } },
+        { name: 'delete_project', description: 'Permanently delete a project and all its files', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
 
         // ---- Feature tools ----
-        {
-          name: 'add_feature',
-          description: 'Add a feature capability to a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              name: {
-                type: 'string',
-                description: 'Name of the feature (e.g. "project-wide-search")',
-              },
-              description: {
-                type: 'string',
-                description: 'Description of the feature capability',
-              },
-              priority: {
-                type: 'string',
-                enum: ['low', 'medium', 'high', 'critical'],
-                description: 'Priority (default: medium)',
-              },
-            },
-            required: ['projectName', 'name', 'description'],
-          },
-        },
-        {
-          name: 'list_features',
-          description: 'List all features for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'get_feature',
-          description: 'Get a single feature by name',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              featureName: {
-                type: 'string',
-                description: 'Name of the feature',
-              },
-            },
-            required: ['projectName', 'featureName'],
-          },
-        },
-        {
-          name: 'update_feature',
-          description: 'Update a feature\'s description, priority, status or dependencies',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              featureName: {
-                type: 'string',
-                description: 'Name of the feature',
-              },
-              description: {
-                type: 'string',
-                description: 'New description',
-              },
-              priority: {
-                type: 'string',
-                enum: ['low', 'medium', 'high', 'critical'],
-              },
-              status: {
-                type: 'string',
-                enum: ['proposed', 'approved', 'in-progress', 'completed', 'cancelled'],
-              },
-              dependencies: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Array of feature IDs this depends on',
-              },
-            },
-            required: ['projectName', 'featureName'],
-          },
-        },
-        {
-          name: 'delete_feature',
-          description: 'Delete a feature from a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              featureName: {
-                type: 'string',
-                description: 'Name of the feature to delete',
-              },
-            },
-            required: ['projectName', 'featureName'],
-          },
-        },
+        { name: 'add_feature', description: 'Add a feature capability to a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] } }, required: ['projectName', 'name', 'description'] } },
+        { name: 'list_features', description: 'List all features for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_feature', description: 'Get a single feature by name', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, featureName: { type: 'string' } }, required: ['projectName', 'featureName'] } },
+        { name: 'update_feature', description: "Update a feature's description, priority, status or dependencies", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, featureName: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] }, status: { type: 'string', enum: ['proposed', 'approved', 'in-progress', 'completed', 'cancelled'] }, dependencies: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'featureName'] } },
+        { name: 'delete_feature', description: 'Delete a feature from a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, featureName: { type: 'string' } }, required: ['projectName', 'featureName'] } },
 
         // ---- TechSpec tools ----
-        {
-          name: 'add_techspec',
-          description: 'Add a technical specification tied to a feature',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              name: {
-                type: 'string',
-                description: 'Name of the technical spec',
-              },
-              description: {
-                type: 'string',
-                description: 'Brief description',
-              },
-              featureId: {
-                type: 'string',
-                description: 'ID of the feature this spec belongs to',
-              },
-              details: {
-                type: 'string',
-                description: 'Full technical specification details',
-              },
-            },
-            required: ['projectName', 'name', 'description', 'featureId', 'details'],
-          },
-        },
-        {
-          name: 'list_techspecs',
-          description: 'List all technical specifications for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'get_techspec',
-          description: 'Get a single technical specification by name',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              techSpecName: {
-                type: 'string',
-                description: 'Name of the technical specification',
-              },
-            },
-            required: ['projectName', 'techSpecName'],
-          },
-        },
-        {
-          name: 'update_techspec',
-          description: 'Update a technical specification\'s description, featureId, or details',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              techSpecName: {
-                type: 'string',
-                description: 'Name of the technical specification',
-              },
-              description: {
-                type: 'string',
-                description: 'New description',
-              },
-              featureId: {
-                type: 'string',
-                description: 'ID of the feature this spec belongs to',
-              },
-              details: {
-                type: 'string',
-                description: 'Full technical specification details',
-              },
-            },
-            required: ['projectName', 'techSpecName'],
-          },
-        },
-        {
-          name: 'delete_techspec',
-          description: 'Delete a technical specification from a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              techSpecName: {
-                type: 'string',
-                description: 'Name of the technical specification to delete',
-              },
-            },
-            required: ['projectName', 'techSpecName'],
-          },
-        },
+        { name: 'add_techspec', description: 'Add a technical specification tied to a feature', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' }, featureId: { type: 'string' }, details: { type: 'string' } }, required: ['projectName', 'name', 'description', 'featureId', 'details'] } },
+        { name: 'list_techspecs', description: 'List all technical specifications for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_techspec', description: 'Get a single technical specification by name', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, techSpecName: { type: 'string' } }, required: ['projectName', 'techSpecName'] } },
+        { name: 'update_techspec', description: "Update a technical specification's description, featureId, or details", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, techSpecName: { type: 'string' }, description: { type: 'string' }, featureId: { type: 'string' }, details: { type: 'string' } }, required: ['projectName', 'techSpecName'] } },
+        { name: 'delete_techspec', description: 'Delete a technical specification from a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, techSpecName: { type: 'string' } }, required: ['projectName', 'techSpecName'] } },
 
         // ---- Research tools ----
-        {
-          name: 'add_research',
-          description: 'Add a research session with findings to a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              sessionName: {
-                type: 'string',
-                description: 'Name for this research session (e.g. "search-libraries-comparison")',
-              },
-              query: {
-                type: 'string',
-                description: 'The research question or query',
-              },
-              findings: {
-                type: 'string',
-                description: 'What was found during research',
-              },
-              conclusions: {
-                type: 'string',
-                description: 'Conclusions drawn from the research',
-              },
-              sources: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'URLs or references to sources',
-              },
-            },
-            required: ['projectName', 'sessionName', 'query', 'findings', 'conclusions'],
-          },
-        },
-        {
-          name: 'list_research',
-          description: 'List all research sessions for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'get_research',
-          description: 'Get a single research session by name',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              sessionName: {
-                type: 'string',
-                description: 'Name of the research session',
-              },
-            },
-            required: ['projectName', 'sessionName'],
-          },
-        },
-        {
-          name: 'update_research',
-          description: 'Update a research session\'s findings, conclusions, or sources',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              sessionName: {
-                type: 'string',
-                description: 'Name of the research session',
-              },
-              findings: {
-                type: 'string',
-                description: 'Updated findings',
-              },
-              conclusions: {
-                type: 'string',
-                description: 'Updated conclusions',
-              },
-              sources: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Updated list of sources',
-              },
-            },
-            required: ['projectName', 'sessionName'],
-          },
-        },
-        {
-          name: 'delete_research',
-          description: 'Delete a research session from a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              sessionName: {
-                type: 'string',
-                description: 'Name of the research session to delete',
-              },
-            },
-            required: ['projectName', 'sessionName'],
-          },
-        },
+        { name: 'add_research', description: 'Add a research session with findings to a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, sessionName: { type: 'string' }, query: { type: 'string' }, findings: { type: 'string' }, conclusions: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'sessionName', 'query', 'findings', 'conclusions'] } },
+        { name: 'list_research', description: 'List all research sessions for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_research', description: 'Get a single research session by name', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, sessionName: { type: 'string' } }, required: ['projectName', 'sessionName'] } },
+        { name: 'update_research', description: "Update a research session's findings, conclusions, or sources", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, sessionName: { type: 'string' }, findings: { type: 'string' }, conclusions: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'sessionName'] } },
+        { name: 'delete_research', description: 'Delete a research session from a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, sessionName: { type: 'string' } }, required: ['projectName', 'sessionName'] } },
 
         // ---- Plan tools ----
-        {
-          name: 'create_plan',
-          description: 'Create an implementation plan for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              name: {
-                type: 'string',
-                description: 'Name of the plan',
-              },
-              description: {
-                type: 'string',
-                description: 'Description of the plan',
-              },
-              featureIds: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'IDs of features this plan covers',
-              },
-              techSpecIds: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'IDs of tech specs this plan references',
-              },
-              steps: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Step-by-step implementation steps',
-              },
-            },
-            required: ['projectName', 'name', 'description'],
-          },
-        },
-        {
-          name: 'list_plans',
-          description: 'List all plans for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'update_plan_status',
-          description: 'Update a plan\'s status and optional steps',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              planName: {
-                type: 'string',
-                description: 'Name of the plan',
-              },
-              status: {
-                type: 'string',
-                enum: ['draft', 'review', 'approved', 'implementing', 'complete'],
-                description: 'New status',
-              },
-              steps: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Updated implementation steps (optional)',
-              },
-            },
-            required: ['projectName', 'planName', 'status'],
-          },
-        },
-        {
-          name: 'delete_plan',
-          description: 'Delete a plan from a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              planName: {
-                type: 'string',
-                description: 'Name of the plan to delete',
-              },
-            },
-            required: ['projectName', 'planName'],
-          },
-        },
+        { name: 'create_plan', description: 'Create an implementation plan for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' }, featureIds: { type: 'array', items: { type: 'string' } }, techSpecIds: { type: 'array', items: { type: 'string' } }, steps: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'name', 'description'] } },
+        { name: 'list_plans', description: 'List all plans for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'update_plan_status', description: "Update a plan's status and optional steps", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, planName: { type: 'string' }, status: { type: 'string', enum: ['draft', 'review', 'approved', 'implementing', 'complete'] }, steps: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'planName', 'status'] } },
+        { name: 'delete_plan', description: 'Delete a plan from a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, planName: { type: 'string' } }, required: ['projectName', 'planName'] } },
 
         // ---- Task tools ----
-        {
-          name: 'create_task',
-          description: 'Create a task (job-board style) for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              name: {
-                type: 'string',
-                description: 'Name of the task',
-              },
-              description: {
-                type: 'string',
-                description: 'Description of the task',
-              },
-              priority: {
-                type: 'string',
-                enum: ['low', 'medium', 'high', 'critical'],
-                description: 'Priority (default: medium)',
-              },
-              dependencies: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Task IDs this task depends on',
-              },
-              planId: {
-                type: 'string',
-                description: 'ID of the plan this task belongs to',
-              },
-            },
-            required: ['projectName', 'name', 'description'],
-          },
-        },
-        {
-          name: 'list_tasks',
-          description: 'List all tasks for a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'get_task',
-          description: 'Get a single task by name',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              taskName: {
-                type: 'string',
-                description: 'Name of the task',
-              },
-            },
-            required: ['projectName', 'taskName'],
-          },
-        },
-        {
-          name: 'update_task_status',
-          description: 'Update a task\'s status',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              taskName: {
-                type: 'string',
-                description: 'Name of the task',
-              },
-              status: {
-                type: 'string',
-                enum: ['pending', 'in-progress', 'completed', 'blocked'],
-                description: 'New status',
-              },
-            },
-            required: ['projectName', 'taskName', 'status'],
-          },
-        },
-        {
-          name: 'update_task',
-          description: 'Update a task\'s description, priority, status, assignee, or dependencies',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              taskName: {
-                type: 'string',
-                description: 'Name of the task',
-              },
-              description: {
-                type: 'string',
-                description: 'New description',
-              },
-              priority: {
-                type: 'string',
-                enum: ['low', 'medium', 'high', 'critical'],
-                description: 'New priority',
-              },
-              status: {
-                type: 'string',
-                enum: ['pending', 'in-progress', 'completed', 'blocked'],
-                description: 'New status',
-              },
-              assignedTo: {
-                type: 'string',
-                description: 'Who to assign the task to',
-              },
-              dependencies: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Task IDs this task depends on',
-              },
-            },
-            required: ['projectName', 'taskName'],
-          },
-        },
-        {
-          name: 'assign_task',
-          description: 'Assign a task to someone',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              taskName: {
-                type: 'string',
-                description: 'Name of the task',
-              },
-              assignee: {
-                type: 'string',
-                description: 'Who to assign the task to',
-              },
-            },
-            required: ['projectName', 'taskName', 'assignee'],
-          },
-        },
-        {
-          name: 'delete_task',
-          description: 'Delete a task from a project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              taskName: {
-                type: 'string',
-                description: 'Name of the task to delete',
-              },
-            },
-            required: ['projectName', 'taskName'],
-          },
-        },
+        { name: 'create_task', description: 'Create a task for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] }, dependencies: { type: 'array', items: { type: 'string' } }, planId: { type: 'string' } }, required: ['projectName', 'name', 'description'] } },
+        { name: 'list_tasks', description: 'List all tasks for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_task', description: 'Get a single task by name', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' } }, required: ['projectName', 'taskName'] } },
+        { name: 'update_task_status', description: "Update a task's status", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' }, status: { type: 'string', enum: ['pending', 'in-progress', 'completed', 'blocked'] } }, required: ['projectName', 'taskName', 'status'] } },
+        { name: 'update_task', description: "Update a task's description, priority, status, assignee, or dependencies", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] }, status: { type: 'string', enum: ['pending', 'in-progress', 'completed', 'blocked'] }, assignedTo: { type: 'string' }, dependencies: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'taskName'] } },
+        { name: 'assign_task', description: 'Assign a task to someone', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' }, assignee: { type: 'string' } }, required: ['projectName', 'taskName', 'assignee'] } },
+        { name: 'delete_task', description: 'Delete a task from a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, taskName: { type: 'string' } }, required: ['projectName', 'taskName'] } },
 
-        // ---- Advanced tools ----
-        {
-          name: 'search_project',
-          description:
-            'Full-text search across all entities (features, techspecs, research, plans, tasks) in a project. Searches names, descriptions, details, steps, findings, and more.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              query: {
-                type: 'string',
-                description: 'Search query string (case-insensitive)',
-              },
-            },
-            required: ['projectName', 'query'],
-          },
-        },
-        {
-          name: 'project_summary',
-          description:
-            'Generate a comprehensive summary of a project including counts and breakdowns by status and priority for features, plans, and tasks.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-            },
-            required: ['projectName'],
-          },
-        },
-        {
-          name: 'dependency_graph',
-          description:
-            'Trace dependencies for a feature or task. Shows what it depends on and what depends on it, up to a configurable depth (default 1, max 3).',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectName: {
-                type: 'string',
-                description: 'Name of the project',
-              },
-              entityType: {
-                type: 'string',
-                enum: ['feature', 'task'],
-                description: 'Type of entity (feature or task)',
-              },
-              entityName: {
-                type: 'string',
-                description: 'Name of the feature or task',
-              },
-              maxDepth: {
-                type: 'number',
-                description: 'Maximum traversal depth (default: 1, max: 3)',
-              },
-            },
-            required: ['projectName', 'entityType', 'entityName'],
-          },
-        },
+        // ---- Decision tools (Tier 3) ----
+        { name: 'add_decision', description: 'Add an architecture decision record (ADR) to document why a technical decision was made', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string', description: 'Title of the decision' }, context: { type: 'string', description: 'Background and constraints leading to this decision' }, decision: { type: 'string', description: 'What was decided' }, rationale: { type: 'string', description: 'Why this approach was chosen' }, consequences: { type: 'string', description: 'Trade-offs and consequences' }, options: { type: 'array', items: { type: 'string' }, description: 'Alternatives considered' }, tags: { type: 'array', items: { type: 'string' }, description: 'Tag names to associate' }, relatedFeatures: { type: 'array', items: { type: 'string' }, description: 'Related feature IDs' } }, required: ['projectName', 'title', 'context', 'decision', 'rationale', 'consequences'] } },
+        { name: 'list_decisions', description: 'List all decision records for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_decision', description: 'Get a single decision record by title', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' } }, required: ['projectName', 'title'] } },
+        { name: 'update_decision', description: "Update a decision record's fields or status", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' }, context: { type: 'string' }, options: { type: 'array', items: { type: 'string' } }, decision: { type: 'string' }, rationale: { type: 'string' }, consequences: { type: 'string' }, status: { type: 'string', enum: ['proposed', 'accepted', 'deprecated', 'superseded'] }, supersededBy: { type: 'string', description: 'ID of the decision that supersedes this one' }, tags: { type: 'array', items: { type: 'string' } }, relatedFeatures: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'title'] } },
+        { name: 'delete_decision', description: 'Delete a decision record from a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' } }, required: ['projectName', 'title'] } },
+
+        // ---- Risk tools (Tier 3) ----
+        { name: 'add_risk', description: 'Add a risk entry to the project risk register', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string', description: 'Title of the risk' }, description: { type: 'string', description: 'Detailed description' }, category: { type: 'string', enum: ['technical', 'schedule', 'people', 'external', 'budget', 'other'] }, likelihood: { type: 'number', description: 'Likelihood rating (1=almost never to 5=certain)' }, impact: { type: 'number', description: 'Impact rating (1=negligible to 5=catastrophic)' }, mitigation: { type: 'string', description: 'Mitigation strategy' }, contingency: { type: 'string', description: 'Contingency plan' }, owner: { type: 'string', description: 'Risk owner' }, tags: { type: 'array', items: { type: 'string' } }, relatedFeatures: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'title', 'description', 'category', 'likelihood', 'impact'] } },
+        { name: 'list_risks', description: 'List all risks for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_risk', description: 'Get a single risk by title', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' } }, required: ['projectName', 'title'] } },
+        { name: 'update_risk', description: "Update a risk's fields or status", inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' }, description: { type: 'string' }, category: { type: 'string', enum: ['technical', 'schedule', 'people', 'external', 'budget', 'other'] }, likelihood: { type: 'number' }, impact: { type: 'number' }, status: { type: 'string', enum: ['identified', 'mitigating', 'materialized', 'closed'] }, mitigation: { type: 'string' }, contingency: { type: 'string' }, owner: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, relatedFeatures: { type: 'array', items: { type: 'string' } } }, required: ['projectName', 'title'] } },
+        { name: 'delete_risk', description: 'Delete a risk from the project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, title: { type: 'string' } }, required: ['projectName', 'title'] } },
+
+        // ---- Tag tools (Tier 3) ----
+        { name: 'add_tag', description: 'Create a new tag for cross-cutting categorization', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, name: { type: 'string', description: 'Tag name' }, color: { type: 'string', description: 'Hex color (e.g. #ff6600)' }, description: { type: 'string' } }, required: ['projectName', 'name'] } },
+        { name: 'list_tags', description: 'List all tags with assignment counts for a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'remove_tag', description: 'Delete a tag and remove all its assignments', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, name: { type: 'string' } }, required: ['projectName', 'name'] } },
+        { name: 'assign_tag', description: 'Assign a tag to an entity (feature, techspec, research, plan, task, decision, or risk)', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, tagName: { type: 'string' }, targetType: { type: 'string', enum: ['feature', 'techspec', 'research', 'plan', 'task', 'decision', 'risk'] }, targetId: { type: 'string', description: 'ID of the entity to tag' } }, required: ['projectName', 'tagName', 'targetType', 'targetId'] } },
+        { name: 'unassign_tag', description: 'Remove a tag from an entity', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, tagName: { type: 'string' }, targetType: { type: 'string', enum: ['feature', 'techspec', 'research', 'plan', 'task', 'decision', 'risk'] }, targetId: { type: 'string' } }, required: ['projectName', 'tagName', 'targetType', 'targetId'] } },
+        { name: 'search_by_tag', description: 'Find all entities with a given tag', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, tagName: { type: 'string' } }, required: ['projectName', 'tagName'] } },
+
+        // ---- Activity tools (Tier 3) ----
+        { name: 'project_activity', description: 'List activity log entries for a project, optionally filtered', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, entityType: { type: 'string', enum: ['project', 'feature', 'techspec', 'research', 'plan', 'task', 'decision', 'risk', 'tag'], description: 'Filter by entity type' }, action: { type: 'string', enum: ['created', 'updated', 'deleted', 'status_changed', 'reassigned', 'tagged', 'untagged'], description: 'Filter by action type' }, entityId: { type: 'string', description: 'Filter by entity ID' }, limit: { type: 'number', description: 'Max entries to return (default: all)' } }, required: ['projectName'] } },
+
+        // ---- Export/Import tools (Tier 3) ----
+        { name: 'export_project', description: 'Export an entire project as a portable JSON bundle', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'import_project', description: 'Import a project from a previously exported JSON bundle', inputSchema: { type: 'object', properties: { projectExport: { type: 'object', description: 'The project export JSON object (from export_project)' }, importAs: { type: 'string', description: 'Optional new name for the imported project' }, overwriteExisting: { type: 'boolean', description: 'Overwrite if project already exists (default: false)' } }, required: ['projectExport'] } },
+
+        // ---- Advanced tools (existing) ----
+        { name: 'search_project', description: 'Full-text search across all entities in a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, query: { type: 'string' } }, required: ['projectName', 'query'] } },
+        { name: 'project_summary', description: 'Generate a comprehensive summary of a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'dependency_graph', description: 'Trace dependencies for a feature or task up to configurable depth (max 3)', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, entityType: { type: 'string', enum: ['feature', 'task'] }, entityName: { type: 'string' }, maxDepth: { type: 'number', description: 'Max depth (default: 1, max: 3)' } }, required: ['projectName', 'entityType', 'entityName'] } },
       ],
     }));
 
@@ -1924,162 +1664,138 @@ class ProjectPlanerServer {
       try {
         switch (name) {
           // ---- Projects ----
-          case 'create_project':
-            return await this.handleCreateProject(a);
-          case 'list_projects':
-            return await this.handleListProjects();
-          case 'get_project':
-            return await this.handleGetProject(a);
-          case 'update_project':
-            return await this.handleUpdateProject(a);
-          case 'delete_project':
-            return await this.handleDeleteProject(a);
+          case 'create_project': return await this.handleCreateProject(a);
+          case 'list_projects': return await this.handleListProjects();
+          case 'get_project': return await this.handleGetProject(a);
+          case 'update_project': return await this.handleUpdateProject(a);
+          case 'delete_project': return await this.handleDeleteProject(a);
 
           // ---- Features ----
-          case 'add_feature':
-            return await this.handleAddFeature(a);
-          case 'list_features':
-            return await this.handleListFeatures(a);
-          case 'get_feature':
-            return await this.handleGetFeature(a);
-          case 'update_feature':
-            return await this.handleUpdateFeature(a);
-          case 'delete_feature':
-            return await this.handleDeleteFeature(a);
+          case 'add_feature': return await this.handleAddFeature(a);
+          case 'list_features': return await this.handleListFeatures(a);
+          case 'get_feature': return await this.handleGetFeature(a);
+          case 'update_feature': return await this.handleUpdateFeature(a);
+          case 'delete_feature': return await this.handleDeleteFeature(a);
 
           // ---- TechSpecs ----
-          case 'add_techspec':
-            return await this.handleAddTechSpec(a);
-          case 'list_techspecs':
-            return await this.handleListTechSpecs(a);
-          case 'get_techspec':
-            return await this.handleGetTechSpec(a);
-          case 'update_techspec':
-            return await this.handleUpdateTechSpec(a);
-          case 'delete_techspec':
-            return await this.handleDeleteTechSpec(a);
+          case 'add_techspec': return await this.handleAddTechSpec(a);
+          case 'list_techspecs': return await this.handleListTechSpecs(a);
+          case 'get_techspec': return await this.handleGetTechSpec(a);
+          case 'update_techspec': return await this.handleUpdateTechSpec(a);
+          case 'delete_techspec': return await this.handleDeleteTechSpec(a);
 
           // ---- Research ----
-          case 'add_research':
-            return await this.handleAddResearch(a);
-          case 'list_research':
-            return await this.handleListResearch(a);
-          case 'get_research':
-            return await this.handleGetResearch(a);
-          case 'update_research':
-            return await this.handleUpdateResearch(a);
-          case 'delete_research':
-            return await this.handleDeleteResearch(a);
+          case 'add_research': return await this.handleAddResearch(a);
+          case 'list_research': return await this.handleListResearch(a);
+          case 'get_research': return await this.handleGetResearch(a);
+          case 'update_research': return await this.handleUpdateResearch(a);
+          case 'delete_research': return await this.handleDeleteResearch(a);
 
           // ---- Plans ----
-          case 'create_plan':
-            return await this.handleCreatePlan(a);
-          case 'list_plans':
-            return await this.handleListPlans(a);
-          case 'update_plan_status':
-            return await this.handleUpdatePlanStatus(a);
-          case 'delete_plan':
-            return await this.handleDeletePlan(a);
+          case 'create_plan': return await this.handleCreatePlan(a);
+          case 'list_plans': return await this.handleListPlans(a);
+          case 'update_plan_status': return await this.handleUpdatePlanStatus(a);
+          case 'delete_plan': return await this.handleDeletePlan(a);
 
           // ---- Tasks ----
-          case 'create_task':
-            return await this.handleCreateTask(a);
-          case 'list_tasks':
-            return await this.handleListTasks(a);
-          case 'get_task':
-            return await this.handleGetTask(a);
-          case 'update_task_status':
-            return await this.handleUpdateTaskStatus(a);
-          case 'update_task':
-            return await this.handleUpdateTask(a);
-          case 'assign_task':
-            return await this.handleAssignTask(a);
-          case 'delete_task':
-            return await this.handleDeleteTask(a);
+          case 'create_task': return await this.handleCreateTask(a);
+          case 'list_tasks': return await this.handleListTasks(a);
+          case 'get_task': return await this.handleGetTask(a);
+          case 'update_task_status': return await this.handleUpdateTaskStatus(a);
+          case 'update_task': return await this.handleUpdateTask(a);
+          case 'assign_task': return await this.handleAssignTask(a);
+          case 'delete_task': return await this.handleDeleteTask(a);
+
+          // ---- Decisions ----
+          case 'add_decision': return await this.handleAddDecision(a);
+          case 'list_decisions': return await this.handleListDecisions(a);
+          case 'get_decision': return await this.handleGetDecision(a);
+          case 'update_decision': return await this.handleUpdateDecision(a);
+          case 'delete_decision': return await this.handleDeleteDecision(a);
+
+          // ---- Risks ----
+          case 'add_risk': return await this.handleAddRisk(a);
+          case 'list_risks': return await this.handleListRisks(a);
+          case 'get_risk': return await this.handleGetRisk(a);
+          case 'update_risk': return await this.handleUpdateRisk(a);
+          case 'delete_risk': return await this.handleDeleteRisk(a);
+
+          // ---- Tags ----
+          case 'add_tag': return await this.handleAddTag(a);
+          case 'list_tags': return await this.handleListTags(a);
+          case 'remove_tag': return await this.handleRemoveTag(a);
+          case 'assign_tag': return await this.handleAssignTag(a);
+          case 'unassign_tag': return await this.handleUnassignTag(a);
+          case 'search_by_tag': return await this.handleSearchByTag(a);
+
+          // ---- Activity ----
+          case 'project_activity': return await this.handleProjectActivity(a);
+
+          // ---- Export/Import ----
+          case 'export_project': return await this.handleExportProject(a);
+          case 'import_project': return await this.handleImportProject(a);
 
           // ---- Advanced ----
-          case 'search_project':
-            return await this.handleSearchProject(a);
-          case 'project_summary':
-            return await this.handleProjectSummary(a);
-          case 'dependency_graph':
-            return await this.handleDependencyGraph(a);
+          case 'search_project': return await this.handleSearchProject(a);
+          case 'project_summary': return await this.handleProjectSummary(a);
+          case 'dependency_graph': return await this.handleDependencyGraph(a);
 
-          default:
-            throw new McpError(
-              ErrorCode.MethodNotFound,
-              `Unknown tool: ${name}`
-            );
+          default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
         }
       } catch (err) {
         if (err instanceof McpError) throw err;
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Unexpected error: ${(err as Error).message}`
-        );
+        throw new McpError(ErrorCode.InternalError, `Unexpected error: ${(err as Error).message}`);
       }
     });
   }
 
-  // -- Project handlers ----------------------------------------------------
+  // -- Handler methods -----------------------------------------------------
+
+  // --- Project handlers ---
 
   private async handleCreateProject(args: Record<string, unknown>) {
     const name = getString(args, 'name');
     const description = getOptionalString(args, 'description') ?? '';
-    const project = await store.createProject(name, description);
-    return textResponse(project);
+    return textResponse(await store.createProject(name, description));
   }
 
-  private async handleListProjects() {
-    const projects = await store.listProjects();
-    return textResponse(projects);
-  }
+  private async handleListProjects() { return textResponse(await store.listProjects()); }
 
   private async handleGetProject(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const project = await store.getProject(projectName);
-    return textResponse(project);
+    return textResponse(await store.getProject(getString(args, 'projectName')));
   }
 
   private async handleUpdateProject(args: Record<string, unknown>) {
     const projectName = getString(args, 'projectName');
-    const description = getOptionalString(args, 'description');
-    const status = args.status as 'active' | 'archived' | undefined;
     const updates: Record<string, unknown> = {};
+    const description = getOptionalString(args, 'description');
+    const status = getOptionalEnum(args, 'status', ['active', 'archived'] as const);
     if (description !== undefined) updates.description = description;
     if (status !== undefined) updates.status = status;
-    const project = await store.updateProject(projectName, updates as any);
-    return textResponse(project);
+    return textResponse(await store.updateProject(projectName, updates as any));
   }
 
   private async handleDeleteProject(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    await store.deleteProject(projectName);
-    return textResponse({ deleted: projectName });
+    await store.deleteProject(getString(args, 'projectName'));
+    return textResponse({ deleted: true });
   }
 
-  // -- Feature handlers ----------------------------------------------------
+  // --- Feature handlers ---
 
   private async handleAddFeature(args: Record<string, unknown>) {
     const projectName = getString(args, 'projectName');
     const name = getString(args, 'name');
     const description = getString(args, 'description');
     const priority = (args.priority as Feature['priority']) ?? 'medium';
-    const feature = await store.addFeature(projectName, name, description, priority);
-    return textResponse(feature);
+    return textResponse(await store.addFeature(projectName, name, description, priority));
   }
 
   private async handleListFeatures(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const features = await store.listFeatures(projectName);
-    return textResponse(features);
+    return textResponse(await store.listFeatures(getString(args, 'projectName')));
   }
 
   private async handleGetFeature(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const featureName = getString(args, 'featureName');
-    const feature = await store.getFeature(projectName, featureName);
-    return textResponse(feature);
+    return textResponse(await store.getFeature(getString(args, 'projectName'), getString(args, 'featureName')));
   }
 
   private async handleUpdateFeature(args: Record<string, unknown>) {
@@ -2087,47 +1803,33 @@ class ProjectPlanerServer {
     const featureName = getString(args, 'featureName');
     const updates: Record<string, unknown> = {};
     const description = getOptionalString(args, 'description');
-    const priority = args.priority as Feature['priority'] | undefined;
-    const status = args.status as Feature['status'] | undefined;
+    const priority = getOptionalEnum(args, 'priority', ['low', 'medium', 'high', 'critical'] as const);
+    const status = getOptionalEnum(args, 'status', ['proposed', 'approved', 'in-progress', 'completed', 'cancelled'] as const);
     const dependencies = getStringArray(args, 'dependencies');
     if (description !== undefined) updates.description = description;
     if (priority !== undefined) updates.priority = priority;
     if (status !== undefined) updates.status = status;
     if (dependencies.length > 0) updates.dependencies = dependencies;
-    const feature = await store.updateFeature(projectName, featureName, updates as any);
-    return textResponse(feature);
+    return textResponse(await store.updateFeature(projectName, featureName, updates as any));
   }
 
   private async handleDeleteFeature(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const featureName = getString(args, 'featureName');
-    await store.deleteFeature(projectName, featureName);
-    return textResponse({ deleted: featureName });
+    await store.deleteFeature(getString(args, 'projectName'), getString(args, 'featureName'));
+    return textResponse({ deleted: true });
   }
 
-  // -- TechSpec handlers ---------------------------------------------------
+  // --- TechSpec handlers ---
 
   private async handleAddTechSpec(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const name = getString(args, 'name');
-    const description = getString(args, 'description');
-    const featureId = getString(args, 'featureId');
-    const details = getString(args, 'details');
-    const spec = await store.addTechSpec(projectName, name, description, featureId, details);
-    return textResponse(spec);
+    return textResponse(await store.addTechSpec(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getString(args, 'featureId'), getString(args, 'details')));
   }
 
   private async handleListTechSpecs(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const specs = await store.listTechSpecs(projectName);
-    return textResponse(specs);
+    return textResponse(await store.listTechSpecs(getString(args, 'projectName')));
   }
 
   private async handleGetTechSpec(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const techSpecName = getString(args, 'techSpecName');
-    const spec = await store.getTechSpec(projectName, techSpecName);
-    return textResponse(spec);
+    return textResponse(await store.getTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName')));
   }
 
   private async handleUpdateTechSpec(args: Record<string, unknown>) {
@@ -2140,48 +1842,26 @@ class ProjectPlanerServer {
     if (description !== undefined) updates.description = description;
     if (featureId !== undefined) updates.featureId = featureId;
     if (details !== undefined) updates.details = details;
-    const spec = await store.updateTechSpec(projectName, techSpecName, updates as any);
-    return textResponse(spec);
+    return textResponse(await store.updateTechSpec(projectName, techSpecName, updates as any));
   }
 
   private async handleDeleteTechSpec(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const techSpecName = getString(args, 'techSpecName');
-    await store.deleteTechSpec(projectName, techSpecName);
-    return textResponse({ deleted: techSpecName });
+    await store.deleteTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName'));
+    return textResponse({ deleted: true });
   }
 
-  // -- Research handlers ---------------------------------------------------
+  // --- Research handlers ---
 
   private async handleAddResearch(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const sessionName = getString(args, 'sessionName');
-    const query = getString(args, 'query');
-    const findings = getString(args, 'findings');
-    const conclusions = getString(args, 'conclusions');
-    const sources = getStringArray(args, 'sources');
-    const session = await store.addResearch(
-      projectName,
-      sessionName,
-      query,
-      findings,
-      conclusions,
-      sources
-    );
-    return textResponse(session);
+    return textResponse(await store.addResearch(getString(args, 'projectName'), getString(args, 'sessionName'), getString(args, 'query'), getString(args, 'findings'), getString(args, 'conclusions'), getStringArray(args, 'sources')));
   }
 
   private async handleListResearch(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const sessions = await store.listResearch(projectName);
-    return textResponse(sessions);
+    return textResponse(await store.listResearch(getString(args, 'projectName')));
   }
 
   private async handleGetResearch(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const sessionName = getString(args, 'sessionName');
-    const session = await store.getResearch(projectName, sessionName);
-    return textResponse(session);
+    return textResponse(await store.getResearch(getString(args, 'projectName'), getString(args, 'sessionName')));
   }
 
   private async handleUpdateResearch(args: Record<string, unknown>) {
@@ -2194,96 +1874,62 @@ class ProjectPlanerServer {
     if (findings !== undefined) updates.findings = findings;
     if (conclusions !== undefined) updates.conclusions = conclusions;
     if (sources.length > 0) updates.sources = sources;
-    const session = await store.updateResearch(projectName, sessionName, updates as any);
-    return textResponse(session);
+    return textResponse(await store.updateResearch(projectName, sessionName, updates as any));
   }
 
   private async handleDeleteResearch(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const sessionName = getString(args, 'sessionName');
-    await store.deleteResearch(projectName, sessionName);
-    return textResponse({ deleted: sessionName });
+    await store.deleteResearch(getString(args, 'projectName'), getString(args, 'sessionName'));
+    return textResponse({ deleted: true });
   }
 
-  // -- Plan handlers -------------------------------------------------------
+  // --- Plan handlers ---
 
   private async handleCreatePlan(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const name = getString(args, 'name');
-    const description = getString(args, 'description');
-    const featureIds = getStringArray(args, 'featureIds');
-    const techSpecIds = getStringArray(args, 'techSpecIds');
-    const steps = getStringArray(args, 'steps');
-    const plan = await store.createPlan(projectName, name, description, featureIds, techSpecIds, steps);
-    return textResponse(plan);
+    return textResponse(await store.createPlan(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getStringArray(args, 'featureIds'), getStringArray(args, 'techSpecIds'), getStringArray(args, 'steps')));
   }
 
   private async handleListPlans(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const plans = await store.listPlans(projectName);
-    return textResponse(plans);
+    return textResponse(await store.listPlans(getString(args, 'projectName')));
   }
 
   private async handleUpdatePlanStatus(args: Record<string, unknown>) {
     const projectName = getString(args, 'projectName');
     const planName = getString(args, 'planName');
-    const status = args.status as Plan['status'];
-    if (!status) {
-      throw new McpError(ErrorCode.InvalidParams, '"status" is required');
-    }
+    const status = getOptionalEnum(args, 'status', ['draft', 'review', 'approved', 'implementing', 'complete'] as const);
+    if (!status) throw new McpError(ErrorCode.InvalidParams, '"status" is required');
     const steps = getStringArray(args, 'steps');
-    const plan = await store.updatePlanStatus(projectName, planName, status, steps.length > 0 ? steps : undefined);
-    return textResponse(plan);
+    return textResponse(await store.updatePlanStatus(projectName, planName, status, steps.length > 0 ? steps : undefined));
   }
 
   private async handleDeletePlan(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const planName = getString(args, 'planName');
-    await store.deletePlan(projectName, planName);
-    return textResponse({ deleted: planName });
+    await store.deletePlan(getString(args, 'projectName'), getString(args, 'planName'));
+    return textResponse({ deleted: true });
   }
 
-  // -- Task handlers -------------------------------------------------------
+  // --- Task handlers ---
 
   private async handleCreateTask(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const name = getString(args, 'name');
-    const description = getString(args, 'description');
-    const priority = (args.priority as Task['priority']) ?? 'medium';
-    const dependencies = getStringArray(args, 'dependencies');
-    const planId = getOptionalString(args, 'planId') ?? '';
-    const task = await store.createTask(projectName, name, description, priority, dependencies, planId);
-    return textResponse(task);
+    return textResponse(await store.createTask(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), (args.priority as Task['priority']) ?? 'medium', getStringArray(args, 'dependencies'), getOptionalString(args, 'planId') ?? ''));
   }
 
   private async handleListTasks(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const tasks = await store.listTasks(projectName);
-    return textResponse(tasks);
+    return textResponse(await store.listTasks(getString(args, 'projectName')));
   }
 
   private async handleGetTask(args: Record<string, unknown>) {
     const projectName = getString(args, 'projectName');
     const taskName = getString(args, 'taskName');
     const task = await store.getTask(projectName, taskName);
-    if (!task) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Task "${taskName}" not found in project "${projectName}"`
-      );
-    }
+    if (!task) throw new McpError(ErrorCode.InvalidParams, `Task "${taskName}" not found in project "${projectName}"`);
     return textResponse(task);
   }
 
   private async handleUpdateTaskStatus(args: Record<string, unknown>) {
     const projectName = getString(args, 'projectName');
     const taskName = getString(args, 'taskName');
-    const status = args.status as Task['status'];
-    if (!status) {
-      throw new McpError(ErrorCode.InvalidParams, '"status" is required');
-    }
-    const task = await store.updateTaskStatus(projectName, taskName, status);
-    return textResponse(task);
+    const status = getOptionalEnum(args, 'status', ['pending', 'in-progress', 'completed', 'blocked'] as const);
+    if (!status) throw new McpError(ErrorCode.InvalidParams, '"status" is required');
+    return textResponse(await store.updateTaskStatus(projectName, taskName, status));
   }
 
   private async handleUpdateTask(args: Record<string, unknown>) {
@@ -2291,8 +1937,8 @@ class ProjectPlanerServer {
     const taskName = getString(args, 'taskName');
     const updates: Record<string, unknown> = {};
     const description = getOptionalString(args, 'description');
-    const priority = args.priority as Task['priority'] | undefined;
-    const status = args.status as Task['status'] | undefined;
+    const priority = getOptionalEnum(args, 'priority', ['low', 'medium', 'high', 'critical'] as const);
+    const status = getOptionalEnum(args, 'status', ['pending', 'in-progress', 'completed', 'blocked'] as const);
     const assignedTo = getOptionalString(args, 'assignedTo');
     const dependencies = getStringArray(args, 'dependencies');
     if (description !== undefined) updates.description = description;
@@ -2300,38 +1946,189 @@ class ProjectPlanerServer {
     if (status !== undefined) updates.status = status;
     if (assignedTo !== undefined) updates.assignedTo = assignedTo;
     if (dependencies.length > 0) updates.dependencies = dependencies;
-    const task = await store.updateTask(projectName, taskName, updates as any);
-    return textResponse(task);
+    return textResponse(await store.updateTask(projectName, taskName, updates as any));
   }
 
   private async handleAssignTask(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const taskName = getString(args, 'taskName');
-    const assignee = getString(args, 'assignee');
-    const task = await store.assignTask(projectName, taskName, assignee);
-    return textResponse(task);
+    return textResponse(await store.assignTask(getString(args, 'projectName'), getString(args, 'taskName'), getString(args, 'assignee')));
   }
 
   private async handleDeleteTask(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const taskName = getString(args, 'taskName');
-    await store.deleteTask(projectName, taskName);
-    return textResponse({ deleted: taskName });
+    await store.deleteTask(getString(args, 'projectName'), getString(args, 'taskName'));
+    return textResponse({ deleted: true });
   }
 
-  // -- Advanced handlers ---------------------------------------------------
+  // --- Decision handlers ---
+
+  private async handleAddDecision(args: Record<string, unknown>) {
+    return textResponse(await store.addDecision(
+      getString(args, 'projectName'), getString(args, 'title'),
+      getString(args, 'context'), getString(args, 'decision'),
+      getString(args, 'rationale'), getString(args, 'consequences'),
+      getStringArray(args, 'options'), getStringArray(args, 'tags'),
+      getStringArray(args, 'relatedFeatures')
+    ));
+  }
+
+  private async handleListDecisions(args: Record<string, unknown>) {
+    return textResponse(await store.listDecisions(getString(args, 'projectName')));
+  }
+
+  private async handleGetDecision(args: Record<string, unknown>) {
+    return textResponse(await store.getDecision(getString(args, 'projectName'), getString(args, 'title')));
+  }
+
+  private async handleUpdateDecision(args: Record<string, unknown>) {
+    const projectName = getString(args, 'projectName');
+    const title = getString(args, 'title');
+    const updates: Record<string, unknown> = {};
+    const context = getOptionalString(args, 'context');
+    const options = getStringArray(args, 'options');
+    const decision = getOptionalString(args, 'decision');
+    const rationale = getOptionalString(args, 'rationale');
+    const consequences = getOptionalString(args, 'consequences');
+    const status = getOptionalEnum(args, 'status', ['proposed', 'accepted', 'deprecated', 'superseded'] as const);
+    const supersededBy = getOptionalString(args, 'supersededBy');
+    const tags = getStringArray(args, 'tags');
+    const relatedFeatures = getStringArray(args, 'relatedFeatures');
+    if (context !== undefined) updates.context = context;
+    if (options.length > 0) updates.options = options;
+    if (decision !== undefined) updates.decision = decision;
+    if (rationale !== undefined) updates.rationale = rationale;
+    if (consequences !== undefined) updates.consequences = consequences;
+    if (status !== undefined) updates.status = status;
+    if (supersededBy !== undefined) updates.supersededBy = supersededBy;
+    if (tags.length > 0) updates.tags = tags;
+    if (relatedFeatures.length > 0) updates.relatedFeatures = relatedFeatures;
+    return textResponse(await store.updateDecision(projectName, title, updates as any));
+  }
+
+  private async handleDeleteDecision(args: Record<string, unknown>) {
+    await store.deleteDecision(getString(args, 'projectName'), getString(args, 'title'));
+    return textResponse({ deleted: true });
+  }
+
+  // --- Risk handlers ---
+
+  private async handleAddRisk(args: Record<string, unknown>) {
+    return textResponse(await store.addRisk(
+      getString(args, 'projectName'), getString(args, 'title'),
+      getString(args, 'description'),
+      getString(args, 'category') as Risk['category'],
+      getNumber(args, 'likelihood', 1, 5) as Risk['likelihood'],
+      getNumber(args, 'impact', 1, 5) as Risk['impact'],
+      getOptionalString(args, 'mitigation'),
+      getOptionalString(args, 'contingency'),
+      getOptionalString(args, 'owner'),
+      getStringArray(args, 'tags'),
+      getStringArray(args, 'relatedFeatures')
+    ));
+  }
+
+  private async handleListRisks(args: Record<string, unknown>) {
+    return textResponse(await store.listRisks(getString(args, 'projectName')));
+  }
+
+  private async handleGetRisk(args: Record<string, unknown>) {
+    return textResponse(await store.getRisk(getString(args, 'projectName'), getString(args, 'title')));
+  }
+
+  private async handleUpdateRisk(args: Record<string, unknown>) {
+    const projectName = getString(args, 'projectName');
+    const title = getString(args, 'title');
+    const updates: Record<string, unknown> = {};
+    const description = getOptionalString(args, 'description');
+    const category = getOptionalEnum(args, 'category', ['technical', 'schedule', 'people', 'external', 'budget', 'other'] as const);
+    const likelihood = args.likelihood !== undefined ? getNumber(args, 'likelihood', 1, 5) : undefined;
+    const impact = args.impact !== undefined ? getNumber(args, 'impact', 1, 5) : undefined;
+    const status = getOptionalEnum(args, 'status', ['identified', 'mitigating', 'materialized', 'closed'] as const);
+    const mitigation = getOptionalString(args, 'mitigation');
+    const contingency = getOptionalString(args, 'contingency');
+    const owner = getOptionalString(args, 'owner');
+    const tags = getStringArray(args, 'tags');
+    const relatedFeatures = getStringArray(args, 'relatedFeatures');
+    if (description !== undefined) updates.description = description;
+    if (category !== undefined) updates.category = category;
+    if (likelihood !== undefined) updates.likelihood = likelihood;
+    if (impact !== undefined) updates.impact = impact;
+    if (status !== undefined) updates.status = status;
+    if (mitigation !== undefined) updates.mitigation = mitigation;
+    if (contingency !== undefined) updates.contingency = contingency;
+    if (owner !== undefined) updates.owner = owner;
+    if (tags.length > 0) updates.tags = tags;
+    if (relatedFeatures.length > 0) updates.relatedFeatures = relatedFeatures;
+    return textResponse(await store.updateRisk(projectName, title, updates as any));
+  }
+
+  private async handleDeleteRisk(args: Record<string, unknown>) {
+    await store.deleteRisk(getString(args, 'projectName'), getString(args, 'title'));
+    return textResponse({ deleted: true });
+  }
+
+  // --- Tag handlers ---
+
+  private async handleAddTag(args: Record<string, unknown>) {
+    return textResponse(await store.addTag(getString(args, 'projectName'), getString(args, 'name'), getOptionalString(args, 'color'), getOptionalString(args, 'description')));
+  }
+
+  private async handleListTags(args: Record<string, unknown>) {
+    return textResponse(await store.listTags(getString(args, 'projectName')));
+  }
+
+  private async handleRemoveTag(args: Record<string, unknown>) {
+    await store.removeTag(getString(args, 'projectName'), getString(args, 'name'));
+    return textResponse({ deleted: true });
+  }
+
+  private async handleAssignTag(args: Record<string, unknown>) {
+    await store.assignTag(getString(args, 'projectName'), getString(args, 'tagName'), getString(args, 'targetType') as TagAssignment['targetType'], getString(args, 'targetId'));
+    return textResponse({ assigned: true });
+  }
+
+  private async handleUnassignTag(args: Record<string, unknown>) {
+    await store.unassignTag(getString(args, 'projectName'), getString(args, 'tagName'), getString(args, 'targetType') as TagAssignment['targetType'], getString(args, 'targetId'));
+    return textResponse({ unassigned: true });
+  }
+
+  private async handleSearchByTag(args: Record<string, unknown>) {
+    return textResponse(await store.searchByTag(getString(args, 'projectName'), getString(args, 'tagName')));
+  }
+
+  // --- Activity handler ---
+
+  private async handleProjectActivity(args: Record<string, unknown>) {
+    const projectName = getString(args, 'projectName');
+    const entityType = getOptionalEnum(args, 'entityType', ['project', 'feature', 'techspec', 'research', 'plan', 'task', 'decision', 'risk', 'tag'] as const);
+    const action = getOptionalEnum(args, 'action', ['created', 'updated', 'deleted', 'status_changed', 'reassigned', 'tagged', 'untagged'] as const);
+    const entityId = getOptionalString(args, 'entityId');
+    const limit = getOptionalNumber(args, 'limit');
+    return textResponse(await store.listActivity(projectName, { entityType, action, entityId, limit: limit ? Math.floor(limit) : undefined }));
+  }
+
+  // --- Export/Import handlers ---
+
+  private async handleExportProject(args: Record<string, unknown>) {
+    return textResponse(await store.exportProject(getString(args, 'projectName')));
+  }
+
+  private async handleImportProject(args: Record<string, unknown>) {
+    const projectExport = args.projectExport as ProjectExport;
+    if (!projectExport || typeof projectExport !== 'object') {
+      throw new McpError(ErrorCode.InvalidParams, '"projectExport" must be a valid project export object');
+    }
+    const importAs = getOptionalString(args, 'importAs');
+    const overwriteExisting = getBoolean(args, 'overwriteExisting') ?? false;
+    return textResponse(await store.importProject(projectExport, overwriteExisting, importAs));
+  }
+
+  // --- Advanced handlers ---
 
   private async handleSearchProject(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const query = getString(args, 'query');
-    const results = await store.searchProject(projectName, query);
-    return textResponse(results);
+    return textResponse(await store.searchProject(getString(args, 'projectName'), getString(args, 'query')));
   }
 
   private async handleProjectSummary(args: Record<string, unknown>) {
-    const projectName = getString(args, 'projectName');
-    const summary = await store.projectSummary(projectName);
-    return textResponse(summary);
+    return textResponse(await store.projectSummary(getString(args, 'projectName')));
   }
 
   private async handleDependencyGraph(args: Record<string, unknown>) {
@@ -2339,8 +2136,7 @@ class ProjectPlanerServer {
     const entityType = getString(args, 'entityType') as 'feature' | 'task';
     const entityName = getString(args, 'entityName');
     const maxDepth = getOptionalNumber(args, 'maxDepth') ?? 1;
-    const graph = await store.dependencyGraph(projectName, entityType, entityName, maxDepth);
-    return textResponse(graph);
+    return textResponse(await store.dependencyGraph(projectName, entityType, entityName, maxDepth));
   }
 
   // -- Run ---------------------------------------------------------------
@@ -2348,7 +2144,7 @@ class ProjectPlanerServer {
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Project Planer MCP server v0.3.0 running on stdio');
+    console.error('Project Planer MCP server v0.4.0 running on stdio');
   }
 }
 
