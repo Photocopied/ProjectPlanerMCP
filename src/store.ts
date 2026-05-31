@@ -403,6 +403,12 @@ export class ProjectStore {
   async deleteProject(name: string): Promise<void> {
     const projDir = this.projectDir(name);
     if (!existsSync(projDir)) throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
+    // Safety: log a warning and record activity before nuking the directory
+    console.error(`[WARN] Deleting entire project directory: ${projDir}`);
+    try {
+      const meta = await this.readJson<ProjectMeta>(this.projectMetaPath(name));
+      await this.logActivity(name, 'project', meta.id, meta.name, 'deleted', `Deleted project "${name}" and all its contents`);
+    } catch { /* best-effort: log what we can */ }
     try {
       await rm(projDir, { recursive: true, force: true });
     } catch (err: any) {
@@ -639,14 +645,15 @@ export class ProjectStore {
     return this.readJsonFiles<Plan>(this.plansDir(projectName), 'plan');
   }
 
-  async getPlan(projectName: string, planName: string): Promise<Plan | null> {
+  async getPlan(projectName: string, planName: string): Promise<Plan> {
     const plans = await this.listPlans(projectName);
-    return plans.find((p) => sanitizeName(p.name) === sanitizeName(planName)) ?? null;
+    const plan = plans.find((p) => sanitizeName(p.name) === sanitizeName(planName));
+    if (!plan) throw new McpError(ErrorCode.InvalidParams, `Plan "${planName}" not found in project "${projectName}"`);
+    return plan;
   }
 
   async updatePlanStatus(projectName: string, planName: string, status: Plan['status'], steps?: string[]): Promise<Plan> {
     const plan = await this.getPlan(projectName, planName);
-    if (!plan) throw new McpError(ErrorCode.InvalidParams, `Plan "${planName}" not found in project "${projectName}"`);
     const oldStatus = plan.status;
     plan.status = status;
     if (steps !== undefined) plan.steps = steps;
@@ -691,9 +698,11 @@ export class ProjectStore {
     return this.readJsonFiles<Task>(this.tasksDir(projectName), 'task');
   }
 
-  async getTask(projectName: string, taskName: string): Promise<Task | null> {
+  async getTask(projectName: string, taskName: string): Promise<Task> {
     const tasks = await this.listTasks(projectName);
-    return tasks.find((t) => sanitizeName(t.name) === sanitizeName(taskName)) ?? null;
+    const task = tasks.find((t) => sanitizeName(t.name) === sanitizeName(taskName));
+    if (!task) throw new McpError(ErrorCode.InvalidParams, `Task "${taskName}" not found in project "${projectName}"`);
+    return task;
   }
 
   async updateTask(projectName: string, taskName: string, updates: Partial<Pick<Task, 'description' | 'status' | 'priority' | 'assignedTo' | 'dependencies'>>): Promise<Task> {

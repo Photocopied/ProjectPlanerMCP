@@ -311,7 +311,7 @@ describe('ProjectStore — Plan CRUD', () => {
     try {
       await store.createPlan(projectName, 'p1', 'd', [], [], []);
       await store.deletePlan(projectName, 'p1');
-      expect(await store.getPlan(projectName, 'p1')).toBeNull();
+      await expect(store.getPlan(projectName, 'p1')).rejects.toThrow();
     } finally { cleanup(); }
   });
 
@@ -343,8 +343,7 @@ describe('ProjectStore — Task CRUD', () => {
     try {
       await store.createTask(projectName, 't1', 'd');
       const t = await store.getTask(projectName, 't1');
-      expect(t).not.toBeNull();
-      expect(t!.name).toBe('t1');
+      expect(t.name).toBe('t1');
     } finally { cleanup(); }
   });
 
@@ -365,8 +364,8 @@ describe('ProjectStore — Task CRUD', () => {
       await store.assignTask(projectName, 't1', 'alice');
       await store.updateTaskStatus(projectName, 't1', 'completed');
       const t = await store.getTask(projectName, 't1');
-      expect(t!.assignedTo).toBe('alice');
-      expect(t!.status).toBe('completed');
+      expect(t.assignedTo).toBe('alice');
+      expect(t.status).toBe('completed');
     } finally { cleanup(); }
   });
 
@@ -375,7 +374,7 @@ describe('ProjectStore — Task CRUD', () => {
     try {
       await store.createTask(projectName, 't1', 'd');
       await store.deleteTask(projectName, 't1');
-      expect(await store.getTask(projectName, 't1')).toBeNull();
+      await expect(store.getTask(projectName, 't1')).rejects.toThrow();
     } finally { cleanup(); }
   });
 

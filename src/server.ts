@@ -345,7 +345,7 @@ class ProjectPlanerServer {
 
   private async handleCreateTask(args: Record<string, unknown>) { return textResponse(await store.createTask(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), (args.priority as Task['priority']) ?? 'medium', getStringArray(args, 'dependencies'), getOptionalString(args, 'planId') ?? '')); }
   private async handleListTasks(args: Record<string, unknown>) { return textResponse(await store.listTasks(getString(args, 'projectName'))); }
-  private async handleGetTask(args: Record<string, unknown>) { const t = await store.getTask(getString(args, 'projectName'), getString(args, 'taskName')); if (!t) throw new McpError(ErrorCode.InvalidParams, `Task not found`); return textResponse(t); }
+  private async handleGetTask(args: Record<string, unknown>) { return textResponse(await store.getTask(getString(args, 'projectName'), getString(args, 'taskName'))); }
   private async handleUpdateTaskStatus(args: Record<string, unknown>) { const s = getOptionalEnum(args, 'status', ['pending', 'in-progress', 'completed', 'blocked'] as const); if (!s) throw new McpError(ErrorCode.InvalidParams, '"status" is required'); return textResponse(await store.updateTaskStatus(getString(args, 'projectName'), getString(args, 'taskName'), s)); }
   private async handleUpdateTask(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
