@@ -442,6 +442,31 @@ Import a project from a previously exported JSON bundle. Automatically remaps al
 - **importAs** (string, optional) — New name for the imported project (defaults to original name)
 - **overwriteExisting** (boolean, optional) — Overwrite if project already exists (default: `false`)
 
+### Tier 4 Utility Tools
+
+#### `archive_project`
+Archive a project (sets status to `archived`). Archived projects remain on disk but are excluded from `list_projects` by default.
+
+- **projectName** (string, required) — Name of the project to archive
+
+#### `unarchive_project`
+Unarchive a project (sets status back to `active`).
+
+- **projectName** (string, required) — Name of the project to unarchive
+
+#### `get_project_tree`
+Get a lightweight table-of-contents view of a project showing all entities with their IDs and statuses, plus entity counts per category.
+
+- **projectName** (string, required) — Name of the project
+
+#### `template_project`
+Create a new project seeded from an existing project's structure. Copies features, techspecs, plans, decisions, and tags with reset statuses and new IDs. Optionally copies tasks as well.
+
+- **sourceProjectName** (string, required) — Project to template from
+- **newProjectName** (string, required) — Name for the new project
+- **newDescription** (string, optional) — Description for the new project
+- **copyTasks** (boolean, optional) — Also copy tasks (reset to pending, unassigned)
+
 ### Advanced Tools
 
 #### `search_project`

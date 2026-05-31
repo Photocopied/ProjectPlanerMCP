@@ -194,6 +194,30 @@ interface ProjectSummary {
   tagCount: number;
 }
 
+// For project tree output
+interface ProjectTreeEntry {
+  name: string;
+  id: string;
+  status?: string;
+  title?: string;
+}
+
+interface ProjectTree {
+  projectName: string;
+  structure: {
+    features: ProjectTreeEntry[];
+    techSpecs: ProjectTreeEntry[];
+    research: ProjectTreeEntry[];
+    plans: ProjectTreeEntry[];
+    tasks: ProjectTreeEntry[];
+    decisions: ProjectTreeEntry[];
+    risks: ProjectTreeEntry[];
+    tags: { count: number };
+    activity: { count: number };
+  };
+  entityCounts: Record<string, number>;
+}
+
 // For search results
 interface SearchResult {
   type: string;
@@ -610,6 +634,178 @@ class ProjectStore {
       throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
     }
     await rm(projDir, { recursive: true, force: true });
+  }
+
+  async archiveProject(name: string): Promise<ProjectMeta> {
+    return this.updateProject(name, { status: 'archived' });
+  }
+
+  async unarchiveProject(name: string): Promise<ProjectMeta> {
+    return this.updateProject(name, { status: 'active' });
+  }
+
+  async getProjectTree(projectName: string): Promise<ProjectTree> {
+    await this.getProject(projectName);
+
+    // Helper to read lightweight entries from a directory
+    const readEntries = async <T extends { id: string }>(
+      dir: string,
+      nameKey: string,
+      statusKey?: string,
+      titleKey?: string
+    ): Promise<ProjectTreeEntry[]> => {
+      const files = await this.listJsonFiles(dir);
+      const entries: ProjectTreeEntry[] = [];
+      for (const f of files) {
+        try {
+          const data = await this.readJson<T>(f);
+          const entry: ProjectTreeEntry = {
+            name: String((data as any)[nameKey] ?? 'unknown'),
+            id: data.id,
+          };
+          if (statusKey) entry.status = String((data as any)[statusKey] ?? '');
+          if (titleKey) entry.title = String((data as any)[titleKey] ?? '');
+          entries.push(entry);
+        } catch { /* skip */ }
+      }
+      return entries;
+    };
+
+    const [features, techSpecs, research, plans, tasks, decisions, risks] = await Promise.all([
+      readEntries<Feature>(this.featuresDir(projectName), 'name', 'status'),
+      readEntries<TechSpec>(this.techSpecsDir(projectName), 'name'),
+      readEntries<ResearchSession>(this.researchDir(projectName), 'sessionName'),
+      readEntries<Plan>(this.plansDir(projectName), 'name', 'status'),
+      readEntries<Task>(this.tasksDir(projectName), 'name', 'status'),
+      readEntries<Decision>(this.decisionsDir(projectName), 'title', 'status', 'title'),
+      readEntries<Risk>(this.risksDir(projectName), 'title', 'status', 'title'),
+    ]);
+
+    const tags = await this.readTags(projectName).catch(() => [] as Tag[]);
+    const activityFiles = await this.listJsonFiles(this.activityDir(projectName));
+
+    const structure: ProjectTree['structure'] = {
+      features, techSpecs, research, plans, tasks, decisions, risks,
+      tags: { count: tags.length },
+      activity: { count: activityFiles.length },
+    };
+
+    const entityCounts: Record<string, number> = {
+      features: features.length,
+      techSpecs: techSpecs.length,
+      research: research.length,
+      plans: plans.length,
+      tasks: tasks.length,
+      decisions: decisions.length,
+      risks: risks.length,
+      tags: tags.length,
+      activity: activityFiles.length,
+    };
+
+    return { projectName, structure, entityCounts };
+  }
+
+  async templateProject(
+    sourceProjectName: string,
+    newProjectName: string,
+    newDescription?: string,
+    copyTasks?: boolean
+  ): Promise<ProjectMeta> {
+    // Create the new project
+    const project = await this.createProject(newProjectName, newDescription ?? '');
+
+    // Read source entities
+    const [features, techSpecs, plans, decisions, sourceTags, sourceAssignments] = await Promise.all([
+      this.listFeatures(sourceProjectName),
+      this.listTechSpecs(sourceProjectName),
+      this.listPlans(sourceProjectName),
+      this.listDecisions(sourceProjectName),
+      this.readTags(sourceProjectName).catch(() => [] as Tag[]),
+      this.readTagAssignments(sourceProjectName).catch(() => [] as TagAssignment[]),
+    ]);
+
+    // Copy features with reset status
+    const featureIdMap = new Map<string, string>();
+    for (const f of features) {
+      const newF = await this.addFeature(newProjectName, f.name, f.description, f.priority);
+      featureIdMap.set(f.id, newF.id);
+    }
+
+    // Copy techspecs with remapped feature IDs
+    for (const ts of techSpecs) {
+      const newFeatureId = featureIdMap.get(ts.featureId) ?? '';
+      await this.addTechSpec(newProjectName, ts.name, ts.description, newFeatureId, ts.details);
+    }
+
+    // Copy plans with reset status
+    for (const p of plans) {
+      const newFeatureIds = p.featureIds.map((id) => featureIdMap.get(id) ?? id);
+      await this.createPlan(newProjectName, p.name, p.description, newFeatureIds, p.techSpecIds, p.steps);
+    }
+
+    // Copy decisions with reset status
+    for (const d of decisions) {
+      const newRelatedFeatures = d.relatedFeatures.map((id) => featureIdMap.get(id) ?? id);
+      await this.addDecision(newProjectName, d.title, d.context, d.decision, d.rationale, d.consequences, d.options, d.tags, newRelatedFeatures);
+    }
+
+    // Copy tasks if requested
+    if (copyTasks) {
+      const sourceTasks = await this.listTasks(sourceProjectName);
+      for (const t of sourceTasks) {
+        await this.createTask(newProjectName, t.name, t.description, t.priority, t.dependencies, t.planId);
+      }
+    }
+
+    // Copy tags with new IDs and remap assignments
+    const tagIdMap = new Map<string, string>();
+    for (const st of sourceTags) {
+      const newTag = await this.addTag(newProjectName, st.name, st.color, st.description);
+      tagIdMap.set(st.id, newTag.id);
+    }
+
+    // Remap assignments: only for entities that were copied (features, decisions)
+    const copiedEntityIds = new Set([
+      ...featureIdMap.values(),
+      ...decisions.map((d) => d.id), // decisions get new IDs, need to find them
+    ]);
+    // Actually, decisions get new IDs from addDecision, so we need to map them
+    const newDecisions = await this.listDecisions(newProjectName);
+    const decisionTitleMap = new Map(decisions.map((d, i) => [d.title, newDecisions[i]?.id ?? '']));
+
+    for (const sa of sourceAssignments) {
+      const newTagId = tagIdMap.get(sa.tagId);
+      if (!newTagId) continue;
+
+      // Determine the new target ID
+      let newTargetId = '';
+      if (sa.targetType === 'feature') {
+        newTargetId = featureIdMap.get(sa.targetId) ?? '';
+      } else if (sa.targetType === 'decision') {
+        // Find the decision by its original title
+        const origDecision = decisions.find((d) => d.id === sa.targetId);
+        if (origDecision) {
+          newTargetId = decisionTitleMap.get(origDecision.title) ?? '';
+        }
+      }
+      // Skip other types (techspec, plan, task, risk) — not copied
+
+      if (newTargetId) {
+        try {
+          await this.assignTag(newProjectName, sa.tagId, sa.targetType, newTargetId);
+        } catch {
+          // Tag name may not exist in new project; use the new tag name
+          const newTag = await this.readTags(newProjectName).then((tags) => tags.find((t) => t.id === newTagId));
+          if (newTag) {
+            try {
+              await this.assignTag(newProjectName, newTag.name, sa.targetType, newTargetId);
+            } catch { /* skip */ }
+          }
+        }
+      }
+    }
+
+    return project;
   }
 
   // -- Features ------------------------------------------------------------
@@ -1566,7 +1762,7 @@ class ProjectPlanerServer {
 
   constructor() {
     this.server = new Server(
-      { name: 'project-planer-mcp', version: '0.4.0' },
+      { name: 'project-planer-mcp', version: '0.5.0' },
       { capabilities: { tools: {} } }
     );
 
@@ -1649,6 +1845,12 @@ class ProjectPlanerServer {
         // ---- Export/Import tools (Tier 3) ----
         { name: 'export_project', description: 'Export an entire project as a portable JSON bundle', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
         { name: 'import_project', description: 'Import a project from a previously exported JSON bundle', inputSchema: { type: 'object', properties: { projectExport: { type: 'object', description: 'The project export JSON object (from export_project)' }, importAs: { type: 'string', description: 'Optional new name for the imported project' }, overwriteExisting: { type: 'boolean', description: 'Overwrite if project already exists (default: false)' } }, required: ['projectExport'] } },
+
+        // ---- Tier 4 Utility tools ----
+        { name: 'archive_project', description: 'Archive a project (convenience wrapper around update_project with status=archived)', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'unarchive_project', description: 'Unarchive a project (convenience wrapper around update_project with status=active)', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'get_project_tree', description: 'Get a lightweight table-of-contents view of a project showing all entities with their IDs and statuses', inputSchema: { type: 'object', properties: { projectName: { type: 'string' } }, required: ['projectName'] } },
+        { name: 'template_project', description: 'Create a new project seeded from an existing project\'s structure (copies features, techspecs, plans, decisions, and tags with reset statuses)', inputSchema: { type: 'object', properties: { sourceProjectName: { type: 'string', description: 'Project to template from' }, newProjectName: { type: 'string', description: 'Name for the new project' }, newDescription: { type: 'string', description: 'Description for the new project' }, copyTasks: { type: 'boolean', description: 'Also copy tasks (reset to pending, unassigned)' } }, required: ['sourceProjectName', 'newProjectName'] } },
 
         // ---- Advanced tools (existing) ----
         { name: 'search_project', description: 'Full-text search across all entities in a project', inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, query: { type: 'string' } }, required: ['projectName', 'query'] } },
@@ -1735,6 +1937,12 @@ class ProjectPlanerServer {
           case 'export_project': return await this.handleExportProject(a);
           case 'import_project': return await this.handleImportProject(a);
 
+          // ---- Tier 4 Utility ----
+          case 'archive_project': return await this.handleArchiveProject(a);
+          case 'unarchive_project': return await this.handleUnarchiveProject(a);
+          case 'get_project_tree': return await this.handleGetProjectTree(a);
+          case 'template_project': return await this.handleTemplateProject(a);
+
           // ---- Advanced ----
           case 'search_project': return await this.handleSearchProject(a);
           case 'project_summary': return await this.handleProjectSummary(a);
@@ -1778,6 +1986,28 @@ class ProjectPlanerServer {
   private async handleDeleteProject(args: Record<string, unknown>) {
     await store.deleteProject(getString(args, 'projectName'));
     return textResponse({ deleted: true });
+  }
+
+  // --- Tier 4 Utility handlers ---
+
+  private async handleArchiveProject(args: Record<string, unknown>) {
+    return textResponse(await store.archiveProject(getString(args, 'projectName')));
+  }
+
+  private async handleUnarchiveProject(args: Record<string, unknown>) {
+    return textResponse(await store.unarchiveProject(getString(args, 'projectName')));
+  }
+
+  private async handleGetProjectTree(args: Record<string, unknown>) {
+    return textResponse(await store.getProjectTree(getString(args, 'projectName')));
+  }
+
+  private async handleTemplateProject(args: Record<string, unknown>) {
+    const sourceProjectName = getString(args, 'sourceProjectName');
+    const newProjectName = getString(args, 'newProjectName');
+    const newDescription = getOptionalString(args, 'newDescription');
+    const copyTasks = getBoolean(args, 'copyTasks') ?? false;
+    return textResponse(await store.templateProject(sourceProjectName, newProjectName, newDescription, copyTasks));
   }
 
   // --- Feature handlers ---
@@ -2144,7 +2374,7 @@ class ProjectPlanerServer {
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Project Planer MCP server v0.4.0 running on stdio');
+    console.error('Project Planer MCP server v0.5.0 running on stdio');
   }
 }
 
