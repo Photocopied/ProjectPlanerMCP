@@ -747,6 +747,12 @@ export class ProjectStore {
 
   // -- Bulk Operations -----------------------------------------------------
 
+  /**
+   * Create multiple tasks sequentially. NOT atomic — earlier tasks persist
+   * even if later ones fail. Returns a BulkResult with `succeeded` and
+   * `errors` arrays for caller inspection. This is inherent to the
+   * file-based store (no database transactions).
+   */
   async bulkCreateTasks(projectName: string, tasks: Array<{ name: string; description: string; priority?: Task['priority']; dependencies?: string[]; planId?: string }>): Promise<BulkResult<Task>> {
     const succeeded: Task[] = [];
     const errors: Array<{ index: number; name: string; error: string }> = [];
@@ -761,6 +767,12 @@ export class ProjectStore {
     return { succeeded, errors };
   }
 
+  /**
+   * Update multiple tasks sequentially. NOT atomic — earlier updates persist
+   * even if later ones fail. Returns a BulkResult with `succeeded` and
+   * `errors` arrays for caller inspection. This is inherent to the
+   * file-based store (no database transactions).
+   */
   async bulkUpdateTasks(projectName: string, updates: Array<{ name: string; status?: Task['status']; assignedTo?: string; priority?: Task['priority'] }>): Promise<BulkResult<Task>> {
     const succeeded: Task[] = [];
     const errors: Array<{ index: number; name: string; error: string }> = [];
