@@ -279,6 +279,18 @@ Delete a task from a project.
 - **projectName** (string, required) — Name of the project
 - **taskName** (string, required) — Name of the task to delete
 
+#### `bulk_create_tasks`
+Create multiple tasks in a single call. Tasks are created sequentially — earlier tasks persist even if later ones fail. The response includes `succeeded` and `errors` arrays for caller inspection.
+
+- **projectName** (string, required) — Name of the project
+- **tasks** (array, required) — Array of task objects with `name`, `description`, optional `priority`, `dependencies`, and `planId`
+
+#### `bulk_update_tasks`
+Update status, assignee, or priority on multiple tasks at once. Updates are applied sequentially — earlier updates persist even if later ones fail. The response includes `succeeded` and `errors` arrays.
+
+- **projectName** (string, required) — Name of the project
+- **updates** (array, required) — Array of update objects with `name` and optional `status`, `assignedTo`, and `priority`
+
 ### Decision Record Tools
 
 #### `add_decision`
