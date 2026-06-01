@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/github/license/Photocopied/ProjectPlanerMCP)](LICENSE)
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for creating and managing rich project plans with features, technical specifications, research sessions, implementation plans, architecture decisions, risks, milestones, and tasks. Designed to work with AI assistants like Cline.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for creating and managing rich project plans with features, technical specifications, research sessions, implementation plans, and tasks.
 
 ## Installation
 
@@ -19,12 +19,6 @@ npm run build
 
 # Run
 node build/index.js
-```
-
-Or run directly with npx:
-
-```bash
-npx project-planer-mcp
 ```
 
 ## MCP Settings Configuration
