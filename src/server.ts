@@ -1,5 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -14,12 +15,6 @@ import type {
   TagAssignment,
   ProjectExport,
 } from './types.js';
-
-// ---------------------------------------------------------------------------
-// Store instance
-// ---------------------------------------------------------------------------
-
-const store = new ProjectStore();
 
 // ---------------------------------------------------------------------------
 // Type guards for tool arguments
@@ -89,8 +84,21 @@ function textContentResponse(text: string) {
 
 class ProjectPlanerServer {
   private server: Server;
+  private store: ProjectStore;
 
-  constructor() {
+  constructor(options?: { dataDir?: string }) {
+    const dataDir = options?.dataDir;
+    this.store = dataDir
+      ? new (class extends ProjectStore {
+          constructor() {
+            super();
+            Object.defineProperty(this, 'projectsDir', {
+              value: dataDir,
+              writable: false,
+            });
+          }
+        })()
+      : new ProjectStore();
     this.server = new Server(
       { name: 'project-planer-mcp', version: '0.7.0' },
       { capabilities: { tools: {} } }
@@ -281,72 +289,72 @@ class ProjectPlanerServer {
 
   // -- Handler methods -----------------------------------------------------
 
-  private async handleCreateProject(args: Record<string, unknown>) { return textResponse(await store.createProject(getString(args, 'name'), getOptionalString(args, 'description') ?? '')); }
-  private async handleListProjects() { return textResponse(await store.listProjects()); }
-  private async handleGetProject(args: Record<string, unknown>) { return textResponse(await store.getProject(getString(args, 'projectName'))); }
+  private async handleCreateProject(args: Record<string, unknown>) { return textResponse(await this.store.createProject(getString(args, 'name'), getOptionalString(args, 'description') ?? '')); }
+  private async handleListProjects() { return textResponse(await this.store.listProjects()); }
+  private async handleGetProject(args: Record<string, unknown>) { return textResponse(await this.store.getProject(getString(args, 'projectName'))); }
   private async handleUpdateProject(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const d = getOptionalString(args, 'description'); if (d !== undefined) updates.description = d;
     const s = getOptionalEnum(args, 'status', ['active', 'archived'] as const); if (s !== undefined) updates.status = s;
-    return textResponse(await store.updateProject(getString(args, 'projectName'), updates as any));
+    return textResponse(await this.store.updateProject(getString(args, 'projectName'), updates as any));
   }
-  private async handleDeleteProject(_args: Record<string, unknown>) { await store.deleteProject(getString(_args, 'projectName')); return textResponse({ deleted: true }); }
-  private async handleArchiveProject(args: Record<string, unknown>) { return textResponse(await store.archiveProject(getString(args, 'projectName'))); }
-  private async handleUnarchiveProject(args: Record<string, unknown>) { return textResponse(await store.unarchiveProject(getString(args, 'projectName'))); }
-  private async handleGetProjectTree(args: Record<string, unknown>) { return textResponse(await store.getProjectTree(getString(args, 'projectName'))); }
-  private async handleTemplateProject(args: Record<string, unknown>) { return textResponse(await store.templateProject(getString(args, 'sourceProjectName'), getString(args, 'newProjectName'), getOptionalString(args, 'newDescription'), getBoolean(args, 'copyTasks') ?? false)); }
+  private async handleDeleteProject(_args: Record<string, unknown>) { await this.store.deleteProject(getString(_args, 'projectName')); return textResponse({ deleted: true }); }
+  private async handleArchiveProject(args: Record<string, unknown>) { return textResponse(await this.store.archiveProject(getString(args, 'projectName'))); }
+  private async handleUnarchiveProject(args: Record<string, unknown>) { return textResponse(await this.store.unarchiveProject(getString(args, 'projectName'))); }
+  private async handleGetProjectTree(args: Record<string, unknown>) { return textResponse(await this.store.getProjectTree(getString(args, 'projectName'))); }
+  private async handleTemplateProject(args: Record<string, unknown>) { return textResponse(await this.store.templateProject(getString(args, 'sourceProjectName'), getString(args, 'newProjectName'), getOptionalString(args, 'newDescription'), getBoolean(args, 'copyTasks') ?? false)); }
 
-  private async handleAddFeature(args: Record<string, unknown>) { return textResponse(await store.addFeature(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), (args.priority as Feature['priority']) ?? 'medium')); }
-  private async handleListFeatures(args: Record<string, unknown>) { return textResponse(await store.listFeatures(getString(args, 'projectName'))); }
-  private async handleGetFeature(args: Record<string, unknown>) { return textResponse(await store.getFeature(getString(args, 'projectName'), getString(args, 'featureName'))); }
+  private async handleAddFeature(args: Record<string, unknown>) { return textResponse(await this.store.addFeature(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getOptionalEnum(args, 'priority', ['low', 'medium', 'high', 'critical'] as const) ?? 'medium')); }
+  private async handleListFeatures(args: Record<string, unknown>) { return textResponse(await this.store.listFeatures(getString(args, 'projectName'))); }
+  private async handleGetFeature(args: Record<string, unknown>) { return textResponse(await this.store.getFeature(getString(args, 'projectName'), getString(args, 'featureName'))); }
   private async handleUpdateFeature(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const d = getOptionalString(args, 'description'); if (d !== undefined) updates.description = d;
     const p = getOptionalEnum(args, 'priority', ['low', 'medium', 'high', 'critical'] as const); if (p !== undefined) updates.priority = p;
     const s = getOptionalEnum(args, 'status', ['proposed', 'approved', 'in-progress', 'completed', 'cancelled'] as const); if (s !== undefined) updates.status = s;
     const deps = getStringArray(args, 'dependencies'); if (deps.length > 0) updates.dependencies = deps;
-    return textResponse(await store.updateFeature(getString(args, 'projectName'), getString(args, 'featureName'), updates as any));
+    return textResponse(await this.store.updateFeature(getString(args, 'projectName'), getString(args, 'featureName'), updates as any));
   }
-  private async handleDeleteFeature(args: Record<string, unknown>) { await store.deleteFeature(getString(args, 'projectName'), getString(args, 'featureName')); return textResponse({ deleted: true }); }
+  private async handleDeleteFeature(args: Record<string, unknown>) { await this.store.deleteFeature(getString(args, 'projectName'), getString(args, 'featureName')); return textResponse({ deleted: true }); }
 
-  private async handleAddTechSpec(args: Record<string, unknown>) { return textResponse(await store.addTechSpec(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getString(args, 'featureId'), getString(args, 'details'))); }
-  private async handleListTechSpecs(args: Record<string, unknown>) { return textResponse(await store.listTechSpecs(getString(args, 'projectName'))); }
-  private async handleGetTechSpec(args: Record<string, unknown>) { return textResponse(await store.getTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName'))); }
+  private async handleAddTechSpec(args: Record<string, unknown>) { return textResponse(await this.store.addTechSpec(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getString(args, 'featureId'), getString(args, 'details'))); }
+  private async handleListTechSpecs(args: Record<string, unknown>) { return textResponse(await this.store.listTechSpecs(getString(args, 'projectName'))); }
+  private async handleGetTechSpec(args: Record<string, unknown>) { return textResponse(await this.store.getTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName'))); }
   private async handleUpdateTechSpec(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const d = getOptionalString(args, 'description'); if (d !== undefined) updates.description = d;
     const f = getOptionalString(args, 'featureId'); if (f !== undefined) updates.featureId = f;
     const dt = getOptionalString(args, 'details'); if (dt !== undefined) updates.details = dt;
-    return textResponse(await store.updateTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName'), updates as any));
+    return textResponse(await this.store.updateTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName'), updates as any));
   }
-  private async handleDeleteTechSpec(args: Record<string, unknown>) { await store.deleteTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName')); return textResponse({ deleted: true }); }
+  private async handleDeleteTechSpec(args: Record<string, unknown>) { await this.store.deleteTechSpec(getString(args, 'projectName'), getString(args, 'techSpecName')); return textResponse({ deleted: true }); }
 
-  private async handleAddResearch(args: Record<string, unknown>) { return textResponse(await store.addResearch(getString(args, 'projectName'), getString(args, 'sessionName'), getString(args, 'query'), getString(args, 'findings'), getString(args, 'conclusions'), getStringArray(args, 'sources'))); }
-  private async handleListResearch(args: Record<string, unknown>) { return textResponse(await store.listResearch(getString(args, 'projectName'))); }
-  private async handleGetResearch(args: Record<string, unknown>) { return textResponse(await store.getResearch(getString(args, 'projectName'), getString(args, 'sessionName'))); }
+  private async handleAddResearch(args: Record<string, unknown>) { return textResponse(await this.store.addResearch(getString(args, 'projectName'), getString(args, 'sessionName'), getString(args, 'query'), getString(args, 'findings'), getString(args, 'conclusions'), getStringArray(args, 'sources'))); }
+  private async handleListResearch(args: Record<string, unknown>) { return textResponse(await this.store.listResearch(getString(args, 'projectName'))); }
+  private async handleGetResearch(args: Record<string, unknown>) { return textResponse(await this.store.getResearch(getString(args, 'projectName'), getString(args, 'sessionName'))); }
   private async handleUpdateResearch(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const f = getOptionalString(args, 'findings'); if (f !== undefined) updates.findings = f;
     const c = getOptionalString(args, 'conclusions'); if (c !== undefined) updates.conclusions = c;
     const s = getStringArray(args, 'sources'); if (s.length > 0) updates.sources = s;
-    return textResponse(await store.updateResearch(getString(args, 'projectName'), getString(args, 'sessionName'), updates as any));
+    return textResponse(await this.store.updateResearch(getString(args, 'projectName'), getString(args, 'sessionName'), updates as any));
   }
-  private async handleDeleteResearch(args: Record<string, unknown>) { await store.deleteResearch(getString(args, 'projectName'), getString(args, 'sessionName')); return textResponse({ deleted: true }); }
+  private async handleDeleteResearch(args: Record<string, unknown>) { await this.store.deleteResearch(getString(args, 'projectName'), getString(args, 'sessionName')); return textResponse({ deleted: true }); }
 
-  private async handleCreatePlan(args: Record<string, unknown>) { return textResponse(await store.createPlan(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getStringArray(args, 'featureIds'), getStringArray(args, 'techSpecIds'), getStringArray(args, 'steps'))); }
-  private async handleListPlans(args: Record<string, unknown>) { return textResponse(await store.listPlans(getString(args, 'projectName'))); }
+  private async handleCreatePlan(args: Record<string, unknown>) { return textResponse(await this.store.createPlan(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getStringArray(args, 'featureIds'), getStringArray(args, 'techSpecIds'), getStringArray(args, 'steps'))); }
+  private async handleListPlans(args: Record<string, unknown>) { return textResponse(await this.store.listPlans(getString(args, 'projectName'))); }
   private async handleUpdatePlanStatus(args: Record<string, unknown>) {
     const status = getOptionalEnum(args, 'status', ['draft', 'review', 'approved', 'implementing', 'complete'] as const);
     if (!status) throw new McpError(ErrorCode.InvalidParams, '"status" is required');
     const steps = getStringArray(args, 'steps');
-    return textResponse(await store.updatePlanStatus(getString(args, 'projectName'), getString(args, 'planName'), status, steps.length > 0 ? steps : undefined));
+    return textResponse(await this.store.updatePlanStatus(getString(args, 'projectName'), getString(args, 'planName'), status, steps.length > 0 ? steps : undefined));
   }
-  private async handleDeletePlan(args: Record<string, unknown>) { await store.deletePlan(getString(args, 'projectName'), getString(args, 'planName')); return textResponse({ deleted: true }); }
+  private async handleDeletePlan(args: Record<string, unknown>) { await this.store.deletePlan(getString(args, 'projectName'), getString(args, 'planName')); return textResponse({ deleted: true }); }
 
-  private async handleCreateTask(args: Record<string, unknown>) { return textResponse(await store.createTask(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), (args.priority as Task['priority']) ?? 'medium', getStringArray(args, 'dependencies'), getOptionalString(args, 'planId') ?? '')); }
-  private async handleListTasks(args: Record<string, unknown>) { return textResponse(await store.listTasks(getString(args, 'projectName'))); }
-  private async handleGetTask(args: Record<string, unknown>) { return textResponse(await store.getTask(getString(args, 'projectName'), getString(args, 'taskName'))); }
-  private async handleUpdateTaskStatus(args: Record<string, unknown>) { const s = getOptionalEnum(args, 'status', ['pending', 'in-progress', 'completed', 'blocked'] as const); if (!s) throw new McpError(ErrorCode.InvalidParams, '"status" is required'); return textResponse(await store.updateTaskStatus(getString(args, 'projectName'), getString(args, 'taskName'), s)); }
+  private async handleCreateTask(args: Record<string, unknown>) { return textResponse(await this.store.createTask(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getOptionalEnum(args, 'priority', ['low', 'medium', 'high', 'critical'] as const) ?? 'medium', getStringArray(args, 'dependencies'), getOptionalString(args, 'planId') ?? '')); }
+  private async handleListTasks(args: Record<string, unknown>) { return textResponse(await this.store.listTasks(getString(args, 'projectName'))); }
+  private async handleGetTask(args: Record<string, unknown>) { return textResponse(await this.store.getTask(getString(args, 'projectName'), getString(args, 'taskName'))); }
+  private async handleUpdateTaskStatus(args: Record<string, unknown>) { const s = getOptionalEnum(args, 'status', ['pending', 'in-progress', 'completed', 'blocked'] as const); if (!s) throw new McpError(ErrorCode.InvalidParams, '"status" is required'); return textResponse(await this.store.updateTaskStatus(getString(args, 'projectName'), getString(args, 'taskName'), s)); }
   private async handleUpdateTask(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const d = getOptionalString(args, 'description'); if (d !== undefined) updates.description = d;
@@ -354,17 +362,17 @@ class ProjectPlanerServer {
     const s = getOptionalEnum(args, 'status', ['pending', 'in-progress', 'completed', 'blocked'] as const); if (s !== undefined) updates.status = s;
     const a = getOptionalString(args, 'assignedTo'); if (a !== undefined) updates.assignedTo = a;
     const deps = getStringArray(args, 'dependencies'); if (deps.length > 0) updates.dependencies = deps;
-    return textResponse(await store.updateTask(getString(args, 'projectName'), getString(args, 'taskName'), updates as any));
+    return textResponse(await this.store.updateTask(getString(args, 'projectName'), getString(args, 'taskName'), updates as any));
   }
-  private async handleAssignTask(args: Record<string, unknown>) { return textResponse(await store.assignTask(getString(args, 'projectName'), getString(args, 'taskName'), getString(args, 'assignee'))); }
-  private async handleDeleteTask(args: Record<string, unknown>) { await store.deleteTask(getString(args, 'projectName'), getString(args, 'taskName')); return textResponse({ deleted: true }); }
+  private async handleAssignTask(args: Record<string, unknown>) { return textResponse(await this.store.assignTask(getString(args, 'projectName'), getString(args, 'taskName'), getString(args, 'assignee'))); }
+  private async handleDeleteTask(args: Record<string, unknown>) { await this.store.deleteTask(getString(args, 'projectName'), getString(args, 'taskName')); return textResponse({ deleted: true }); }
 
-  private async handleBulkCreateTasks(args: Record<string, unknown>) { return textResponse(await store.bulkCreateTasks(getString(args, 'projectName'), args.tasks as any[])); }
-  private async handleBulkUpdateTasks(args: Record<string, unknown>) { return textResponse(await store.bulkUpdateTasks(getString(args, 'projectName'), args.updates as any[])); }
+  private async handleBulkCreateTasks(args: Record<string, unknown>) { return textResponse(await this.store.bulkCreateTasks(getString(args, 'projectName'), args.tasks as any[])); }
+  private async handleBulkUpdateTasks(args: Record<string, unknown>) { return textResponse(await this.store.bulkUpdateTasks(getString(args, 'projectName'), args.updates as any[])); }
 
-  private async handleAddDecision(args: Record<string, unknown>) { return textResponse(await store.addDecision(getString(args, 'projectName'), getString(args, 'title'), getString(args, 'context'), getString(args, 'decision'), getString(args, 'rationale'), getString(args, 'consequences'), getStringArray(args, 'options'), getStringArray(args, 'tags'), getStringArray(args, 'relatedFeatures'))); }
-  private async handleListDecisions(args: Record<string, unknown>) { return textResponse(await store.listDecisions(getString(args, 'projectName'))); }
-  private async handleGetDecision(args: Record<string, unknown>) { return textResponse(await store.getDecision(getString(args, 'projectName'), getString(args, 'title'))); }
+  private async handleAddDecision(args: Record<string, unknown>) { return textResponse(await this.store.addDecision(getString(args, 'projectName'), getString(args, 'title'), getString(args, 'context'), getString(args, 'decision'), getString(args, 'rationale'), getString(args, 'consequences'), getStringArray(args, 'options'), getStringArray(args, 'tags'), getStringArray(args, 'relatedFeatures'))); }
+  private async handleListDecisions(args: Record<string, unknown>) { return textResponse(await this.store.listDecisions(getString(args, 'projectName'))); }
+  private async handleGetDecision(args: Record<string, unknown>) { return textResponse(await this.store.getDecision(getString(args, 'projectName'), getString(args, 'title'))); }
   private async handleUpdateDecision(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const c = getOptionalString(args, 'context'); if (c !== undefined) updates.context = c;
@@ -376,13 +384,13 @@ class ProjectPlanerServer {
     const sb = getOptionalString(args, 'supersededBy'); if (sb !== undefined) updates.supersededBy = sb;
     const t = getStringArray(args, 'tags'); if (t.length > 0) updates.tags = t;
     const rf = getStringArray(args, 'relatedFeatures'); if (rf.length > 0) updates.relatedFeatures = rf;
-    return textResponse(await store.updateDecision(getString(args, 'projectName'), getString(args, 'title'), updates as any));
+    return textResponse(await this.store.updateDecision(getString(args, 'projectName'), getString(args, 'title'), updates as any));
   }
-  private async handleDeleteDecision(args: Record<string, unknown>) { await store.deleteDecision(getString(args, 'projectName'), getString(args, 'title')); return textResponse({ deleted: true }); }
+  private async handleDeleteDecision(args: Record<string, unknown>) { await this.store.deleteDecision(getString(args, 'projectName'), getString(args, 'title')); return textResponse({ deleted: true }); }
 
-  private async handleAddRisk(args: Record<string, unknown>) { return textResponse(await store.addRisk(getString(args, 'projectName'), getString(args, 'title'), getString(args, 'description'), getString(args, 'category') as Risk['category'], getNumber(args, 'likelihood', 1, 5) as Risk['likelihood'], getNumber(args, 'impact', 1, 5) as Risk['impact'], getOptionalString(args, 'mitigation'), getOptionalString(args, 'contingency'), getOptionalString(args, 'owner'), getStringArray(args, 'tags'), getStringArray(args, 'relatedFeatures'))); }
-  private async handleListRisks(args: Record<string, unknown>) { return textResponse(await store.listRisks(getString(args, 'projectName'))); }
-  private async handleGetRisk(args: Record<string, unknown>) { return textResponse(await store.getRisk(getString(args, 'projectName'), getString(args, 'title'))); }
+  private async handleAddRisk(args: Record<string, unknown>) { return textResponse(await this.store.addRisk(getString(args, 'projectName'), getString(args, 'title'), getString(args, 'description'), getString(args, 'category') as Risk['category'], getNumber(args, 'likelihood', 1, 5) as Risk['likelihood'], getNumber(args, 'impact', 1, 5) as Risk['impact'], getOptionalString(args, 'mitigation'), getOptionalString(args, 'contingency'), getOptionalString(args, 'owner'), getStringArray(args, 'tags'), getStringArray(args, 'relatedFeatures'))); }
+  private async handleListRisks(args: Record<string, unknown>) { return textResponse(await this.store.listRisks(getString(args, 'projectName'))); }
+  private async handleGetRisk(args: Record<string, unknown>) { return textResponse(await this.store.getRisk(getString(args, 'projectName'), getString(args, 'title'))); }
   private async handleUpdateRisk(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const d = getOptionalString(args, 'description'); if (d !== undefined) updates.description = d;
@@ -395,13 +403,13 @@ class ProjectPlanerServer {
     const o = getOptionalString(args, 'owner'); if (o !== undefined) updates.owner = o;
     const t = getStringArray(args, 'tags'); if (t.length > 0) updates.tags = t;
     const rf = getStringArray(args, 'relatedFeatures'); if (rf.length > 0) updates.relatedFeatures = rf;
-    return textResponse(await store.updateRisk(getString(args, 'projectName'), getString(args, 'title'), updates as any));
+    return textResponse(await this.store.updateRisk(getString(args, 'projectName'), getString(args, 'title'), updates as any));
   }
-  private async handleDeleteRisk(args: Record<string, unknown>) { await store.deleteRisk(getString(args, 'projectName'), getString(args, 'title')); return textResponse({ deleted: true }); }
+  private async handleDeleteRisk(args: Record<string, unknown>) { await this.store.deleteRisk(getString(args, 'projectName'), getString(args, 'title')); return textResponse({ deleted: true }); }
 
-  private async handleAddMilestone(args: Record<string, unknown>) { return textResponse(await store.addMilestone(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getString(args, 'dueDate'), getStringArray(args, 'featureIds'), getStringArray(args, 'planIds'), getStringArray(args, 'taskIds'))); }
-  private async handleListMilestones(args: Record<string, unknown>) { return textResponse(await store.listMilestones(getString(args, 'projectName'))); }
-  private async handleGetMilestone(args: Record<string, unknown>) { return textResponse(await store.getMilestone(getString(args, 'projectName'), getString(args, 'name'))); }
+  private async handleAddMilestone(args: Record<string, unknown>) { return textResponse(await this.store.addMilestone(getString(args, 'projectName'), getString(args, 'name'), getString(args, 'description'), getString(args, 'dueDate'), getStringArray(args, 'featureIds'), getStringArray(args, 'planIds'), getStringArray(args, 'taskIds'))); }
+  private async handleListMilestones(args: Record<string, unknown>) { return textResponse(await this.store.listMilestones(getString(args, 'projectName'))); }
+  private async handleGetMilestone(args: Record<string, unknown>) { return textResponse(await this.store.getMilestone(getString(args, 'projectName'), getString(args, 'name'))); }
   private async handleUpdateMilestone(args: Record<string, unknown>) {
     const updates: Record<string, unknown> = {};
     const d = getOptionalString(args, 'description'); if (d !== undefined) updates.description = d;
@@ -410,42 +418,50 @@ class ProjectPlanerServer {
     const f = getStringArray(args, 'featureIds'); if (f.length > 0) updates.featureIds = f;
     const p = getStringArray(args, 'planIds'); if (p.length > 0) updates.planIds = p;
     const t = getStringArray(args, 'taskIds'); if (t.length > 0) updates.taskIds = t;
-    return textResponse(await store.updateMilestone(getString(args, 'projectName'), getString(args, 'name'), updates as any));
+    return textResponse(await this.store.updateMilestone(getString(args, 'projectName'), getString(args, 'name'), updates as any));
   }
-  private async handleDeleteMilestone(args: Record<string, unknown>) { await store.deleteMilestone(getString(args, 'projectName'), getString(args, 'name')); return textResponse({ deleted: true }); }
+  private async handleDeleteMilestone(args: Record<string, unknown>) { await this.store.deleteMilestone(getString(args, 'projectName'), getString(args, 'name')); return textResponse({ deleted: true }); }
 
-  private async handleAddTag(args: Record<string, unknown>) { return textResponse(await store.addTag(getString(args, 'projectName'), getString(args, 'name'), getOptionalString(args, 'color'), getOptionalString(args, 'description'))); }
-  private async handleListTags(args: Record<string, unknown>) { return textResponse(await store.listTags(getString(args, 'projectName'))); }
-  private async handleRemoveTag(args: Record<string, unknown>) { await store.removeTag(getString(args, 'projectName'), getString(args, 'name')); return textResponse({ deleted: true }); }
-  private async handleAssignTag(args: Record<string, unknown>) { await store.assignTag(getString(args, 'projectName'), getString(args, 'tagName'), getString(args, 'targetType') as TagAssignment['targetType'], getString(args, 'targetId')); return textResponse({ assigned: true }); }
-  private async handleUnassignTag(args: Record<string, unknown>) { await store.unassignTag(getString(args, 'projectName'), getString(args, 'tagName'), getString(args, 'targetType') as TagAssignment['targetType'], getString(args, 'targetId')); return textResponse({ unassigned: true }); }
-  private async handleSearchByTag(args: Record<string, unknown>) { return textResponse(await store.searchByTag(getString(args, 'projectName'), getString(args, 'tagName'))); }
+  private async handleAddTag(args: Record<string, unknown>) { return textResponse(await this.store.addTag(getString(args, 'projectName'), getString(args, 'name'), getOptionalString(args, 'color'), getOptionalString(args, 'description'))); }
+  private async handleListTags(args: Record<string, unknown>) { return textResponse(await this.store.listTags(getString(args, 'projectName'))); }
+  private async handleRemoveTag(args: Record<string, unknown>) { await this.store.removeTag(getString(args, 'projectName'), getString(args, 'name')); return textResponse({ deleted: true }); }
+  private async handleAssignTag(args: Record<string, unknown>) { await this.store.assignTag(getString(args, 'projectName'), getString(args, 'tagName'), getString(args, 'targetType') as TagAssignment['targetType'], getString(args, 'targetId')); return textResponse({ assigned: true }); }
+  private async handleUnassignTag(args: Record<string, unknown>) { await this.store.unassignTag(getString(args, 'projectName'), getString(args, 'tagName'), getString(args, 'targetType') as TagAssignment['targetType'], getString(args, 'targetId')); return textResponse({ unassigned: true }); }
+  private async handleSearchByTag(args: Record<string, unknown>) { return textResponse(await this.store.searchByTag(getString(args, 'projectName'), getString(args, 'tagName'))); }
 
   private async handleProjectActivity(args: Record<string, unknown>) {
     const entityType = getOptionalEnum(args, 'entityType', ['project', 'feature', 'techspec', 'research', 'plan', 'task', 'decision', 'risk', 'tag', 'milestone'] as const);
     const action = getOptionalEnum(args, 'action', ['created', 'updated', 'deleted', 'status_changed', 'reassigned', 'tagged', 'untagged'] as const);
     const entityId = getOptionalString(args, 'entityId');
     const limit = getOptionalNumber(args, 'limit');
-    return textResponse(await store.listActivity(getString(args, 'projectName'), { entityType, action, entityId, limit: limit ? Math.floor(limit) : undefined }));
+    return textResponse(await this.store.listActivity(getString(args, 'projectName'), { entityType, action, entityId, limit: limit ? Math.floor(limit) : undefined }));
   }
 
-  private async handleExportProject(args: Record<string, unknown>) { return textResponse(await store.exportProject(getString(args, 'projectName'))); }
+  private async handleExportProject(args: Record<string, unknown>) { return textResponse(await this.store.exportProject(getString(args, 'projectName'))); }
   private async handleImportProject(args: Record<string, unknown>) {
     const pe = args.projectExport as ProjectExport;
     if (!pe || typeof pe !== 'object') throw new McpError(ErrorCode.InvalidParams, '"projectExport" must be a valid project export object');
-    return textResponse(await store.importProject(pe, getBoolean(args, 'overwriteExisting') ?? false, getOptionalString(args, 'importAs')));
+    return textResponse(await this.store.importProject(pe, getBoolean(args, 'overwriteExisting') ?? false, getOptionalString(args, 'importAs')));
   }
 
-  private async handleValidateProject(args: Record<string, unknown>) { return textResponse(await store.validateProject(getString(args, 'projectName'))); }
-  private async handleExportMarkdown(args: Record<string, unknown>) { return textContentResponse(await store.exportMarkdown(getString(args, 'projectName'))); }
+  private async handleValidateProject(args: Record<string, unknown>) { return textResponse(await this.store.validateProject(getString(args, 'projectName'))); }
+  private async handleExportMarkdown(args: Record<string, unknown>) { return textContentResponse(await this.store.exportMarkdown(getString(args, 'projectName'))); }
 
-  private async handleSearchProject(args: Record<string, unknown>) { return textResponse(await store.searchProject(getString(args, 'projectName'), getString(args, 'query'))); }
-  private async handleProjectSummary(args: Record<string, unknown>) { return textResponse(await store.projectSummary(getString(args, 'projectName'))); }
-  private async handleDependencyGraph(args: Record<string, unknown>) { return textResponse(await store.dependencyGraph(getString(args, 'projectName'), getString(args, 'entityType') as 'feature' | 'task', getString(args, 'entityName'), getOptionalNumber(args, 'maxDepth') ?? 1)); }
+  private async handleSearchProject(args: Record<string, unknown>) { return textResponse(await this.store.searchProject(getString(args, 'projectName'), getString(args, 'query'))); }
+  private async handleProjectSummary(args: Record<string, unknown>) { return textResponse(await this.store.projectSummary(getString(args, 'projectName'))); }
+  private async handleDependencyGraph(args: Record<string, unknown>) { return textResponse(await this.store.dependencyGraph(getString(args, 'projectName'), getString(args, 'entityType') as 'feature' | 'task', getString(args, 'entityName'), getOptionalNumber(args, 'maxDepth') ?? 1)); }
+
+  /**
+   * Connect the server to any Transport. Used both for stdio (via `run()`)
+   * and for in-memory transports in tests.
+   */
+  async connect(transport: Transport): Promise<void> {
+    await this.server.connect(transport);
+  }
 
   async run(): Promise<void> {
     const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+    await this.connect(transport);
     console.error('Project Planer MCP server v0.7.0 running on stdio');
   }
 }
