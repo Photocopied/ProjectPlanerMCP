@@ -12,11 +12,10 @@ describe('generateId', () => {
     expect(ids.size).toBe(100);
   });
 
-  it('produces a reasonably short alphanumeric string', () => {
+  it('returns a valid UUID v4 format', () => {
     const id = generateId();
-    expect(id.length).toBeGreaterThanOrEqual(6);
-    expect(id.length).toBeLessThanOrEqual(20);
-    expect(id).toMatch(/^[a-z0-9]+$/);
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(id.length).toBe(36);
   });
 });
 
@@ -69,6 +68,21 @@ describe('sanitizeName', () => {
   it('replaces emoji and other non-ASCII symbols with underscores (strip leading/trailing)', () => {
     expect(sanitizeName('hello🚀world')).toBe('hello_world');
     expect(sanitizeName('✨sparkle✨')).toBe('sparkle');
+  });
+
+  it('rejects empty string', () => {
+    expect(() => sanitizeName('')).toThrow('must not be empty');
+  });
+
+  it('rejects input that sanitizes to empty string', () => {
+    expect(() => sanitizeName('!!!')).toThrow('sanitizes to an empty string');
+    expect(() => sanitizeName('__!@#$%^&*__')).toThrow('sanitizes to an empty string');
+    expect(() => sanitizeName('🚀🚀🚀')).toThrow('sanitizes to an empty string');
+  });
+
+  it('rejects purely accented characters that strip to nothing', () => {
+    // Some combining marks may not have base letters; this catches edge cases
+    expect(() => sanitizeName('\u0300\u0301\u0302')).toThrow('sanitizes to an empty string');
   });
 
   it('is idempotent — second pass produces same result', () => {

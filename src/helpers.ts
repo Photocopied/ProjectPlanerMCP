@@ -2,21 +2,30 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
+import { randomUUID } from 'node:crypto';
+
 export function generateId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+  return randomUUID();
 }
 
 export function now(): string {
   return new Date().toISOString();
 }
 
-export function sanitizeName(name: string): string {
-  return name
+export function sanitizeName(name: string, entityLabel: string = 'Name'): string {
+  if (name.length === 0) {
+    throw new Error(`${entityLabel} must not be empty`);
+  }
+  const cleaned = name
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .replace(/_+/g, '_')
     .replace(/^_|_$/g, '');
+  if (cleaned.length === 0) {
+    throw new Error(`${entityLabel} "${name}" sanitizes to an empty string`);
+  }
+  return cleaned;
 }
 
 export function timestampedFilename(prefix: string, name: string): string {

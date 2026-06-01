@@ -1,6 +1,6 @@
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join, relative, basename, dirname } from 'node:path';
+import { join, relative, basename, dirname, resolve } from 'node:path';
 import envPaths from 'env-paths';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { generateId, now, sanitizeName, timestampedFilename, tagColorFromName } from './helpers.js';
@@ -35,6 +35,12 @@ import type {
 /** Maximum number of activity entries kept per project. Oldest are pruned. */
 const DEFAULT_MAX_ACTIVITY = 1_000;
 
+/** Maximum number of entities per array in a project import. */
+const MAX_IMPORT_ENTITIES = 10_000;
+
+/** Maximum length of any single string field in an import payload. */
+const MAX_IMPORT_STRING_LENGTH = 100_000;
+
 // ---------------------------------------------------------------------------
 // Directory-based data store
 // ---------------------------------------------------------------------------
@@ -52,6 +58,25 @@ export class ProjectStore {
 
   private projectDir(projectName: string): string {
     return join(this.projectsDir, sanitizeName(projectName));
+  }
+
+  /**
+   * Resolve a project directory and verify it is a strict subdirectory of
+   * the projects root. Throws if the name sanitizes to empty or the
+   * resolved path escapes the projects root (defense-in-depth against
+   * path-traversal via crafted project names).
+   */
+  private safeProjectDir(projectName: string): string {
+    const resolved = join(this.projectsDir, sanitizeName(projectName));
+    const root = resolve(this.projectsDir);
+    const rel = relative(root, resolved);
+    if (rel === '' || rel.startsWith('..') || rel.startsWith('/..') || rel === '.') {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Project name "${projectName}" resolves to an invalid path`
+      );
+    }
+    return resolved;
   }
 
   private projectMetaPath(projectName: string): string {
@@ -120,14 +145,17 @@ export class ProjectStore {
       raw = await readFile(filePath, 'utf-8');
     } catch (err: any) {
       if (err?.code === 'ENOENT') {
-        throw new McpError(ErrorCode.InvalidParams, `Entity not found: ${filePath}`);
+        console.error(`[store] Entity not found at: ${filePath}`);
+        throw new McpError(ErrorCode.InvalidParams, 'Entity not found');
       }
-      throw new McpError(ErrorCode.InternalError, `Failed to read file: ${filePath} — ${err?.message ?? err}`);
+      console.error(`[store] Failed to read file: ${filePath} — ${err?.message ?? err}`);
+      throw new McpError(ErrorCode.InternalError, 'Failed to read entity data');
     }
     try {
       return JSON.parse(raw) as T;
     } catch (err: any) {
-      throw new McpError(ErrorCode.InternalError, `Corrupted JSON in file: ${filePath} — ${err?.message ?? err}`);
+      console.error(`[store] Corrupted JSON in file: ${filePath} — ${err?.message ?? err}`);
+      throw new McpError(ErrorCode.InternalError, 'Corrupted entity data');
     }
   }
 
@@ -401,7 +429,7 @@ export class ProjectStore {
   }
 
   async deleteProject(name: string): Promise<void> {
-    const projDir = this.projectDir(name);
+    const projDir = this.safeProjectDir(name);
     if (!existsSync(projDir)) throw new McpError(ErrorCode.InvalidParams, `Project "${name}" not found`);
     // Safety: log a warning and record activity before nuking the directory
     console.error(`[WARN] Deleting entire project directory: ${projDir}`);
@@ -1014,10 +1042,41 @@ export class ProjectStore {
       if (!Array.isArray((data as any)[key])) {
         throw new McpError(ErrorCode.InvalidParams, `Invalid project export: "${key}" must be an array`);
       }
+      if ((data as any)[key].length > MAX_IMPORT_ENTITIES) {
+        throw new McpError(ErrorCode.InvalidParams, `Import "${key}" exceeds maximum of ${MAX_IMPORT_ENTITIES} entities`);
+      }
+    }
+
+    // Validate string field lengths to prevent resource exhaustion
+    const checkStringLength = (obj: Record<string, unknown>, label: string) => {
+      for (const [field, val] of Object.entries(obj)) {
+        if (typeof val === 'string' && val.length > MAX_IMPORT_STRING_LENGTH) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Field "${field}" in ${label} exceeds maximum length of ${MAX_IMPORT_STRING_LENGTH} characters`
+          );
+        }
+      }
+    };
+    const entityArrays: Array<{ key: keyof ProjectExport; label: string }> = [
+      { key: 'features', label: 'feature' },
+      { key: 'techSpecs', label: 'techSpec' },
+      { key: 'research', label: 'research session' },
+      { key: 'plans', label: 'plan' },
+      { key: 'tasks', label: 'task' },
+      { key: 'decisions', label: 'decision' },
+      { key: 'risks', label: 'risk' },
+      { key: 'milestones', label: 'milestone' },
+      { key: 'tags', label: 'tag' },
+    ];
+    for (const { key, label } of entityArrays) {
+      for (const entity of (data as any)[key] as Record<string, unknown>[]) {
+        checkStringLength(entity, label);
+      }
     }
 
     const projectName = importAs ?? data.project.name;
-    const projDir = this.projectDir(projectName);
+    const projDir = this.safeProjectDir(projectName);
     const metaPath = this.projectMetaPath(projectName);
     if (existsSync(metaPath) && !overwriteExisting) throw new McpError(ErrorCode.InvalidParams, `Project "${projectName}" already exists. Use overwriteExisting=true to replace.`);
     if (existsSync(projDir)) await rm(projDir, { recursive: true, force: true });
