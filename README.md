@@ -61,7 +61,6 @@ Add to your `cline_mcp_settings.json`:
 ```bash
 npm run build     # Compile TypeScript
 npm test          # Run tests
-npm run lint      # Lint
 ```
 
 ## License

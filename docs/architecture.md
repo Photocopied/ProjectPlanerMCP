@@ -72,9 +72,7 @@ ProjectPlanerMCP/
 ├── README.md
 ├── docs/
 │   ├── architecture.md        # This file
-│   ├── tools.md               # Complete tool reference
-│   └── clinerules/
-│       └── project-planer-mcp.md
+│   └── tools.md               # Complete tool reference
 ├── src/
 │   ├── index.ts               # MCP server entry point
 │   ├── server.ts              # MCP server implementation
