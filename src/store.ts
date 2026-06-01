@@ -209,7 +209,7 @@ export class ProjectStore {
   /**
    * Return corrupted files discovered since the last list operation.
    */
-  getCorruptedFiles(projectName: string): CorruptedFile[] {
+  getCorruptedFiles(): CorruptedFile[] {
     return [...this.corruptedFiles];
   }
 
@@ -383,7 +383,7 @@ export class ProjectStore {
   // -- Project -------------------------------------------------------------
 
   async createProject(name: string, description: string): Promise<ProjectMeta> {
-    const projDir = this.projectDir(name);
+    const projDir = this.safeProjectDir(name);
     const metaPath = this.projectMetaPath(name);
     if (existsSync(metaPath)) throw new McpError(ErrorCode.InvalidParams, `Project "${name}" already exists`);
     const project: ProjectMeta = { id: generateId(), name, description, status: 'active', createdAt: now(), updatedAt: now() };
